@@ -56,6 +56,37 @@ def daemon_directory_for_project(project_absolute_path: str) -> str:
     return str(project_root)
 
 
+def wait_for_daemon_ready(process: subprocess.Popen, allocated_port: int, *, project_absolute_path: str | None = None) -> dict:
+    timeout_seconds = max(3.0, float(getattr(settings, "DAEMON_STARTUP_TIMEOUT_SECONDS", 20)))
+    started_at = time.monotonic()
+    last_status = {"state": "unreachable", "pid_alive": False, "port_reachable": False, "reachable": False, "healthy": False, "busy": False}
+
+    while time.monotonic() - started_at < timeout_seconds:
+        return_code = process.poll()
+        if return_code is not None:
+            raise DaemonStartError(
+                f"OpenCode daemon exited before startup completed (exit code {return_code}) on port {allocated_port}."
+            )
+
+        last_status = daemon_runtime_status(process.pid, allocated_port)
+        if last_status.get("reachable") and (last_status.get("healthy") or last_status.get("busy")):
+            return last_status
+
+        time.sleep(0.5)
+
+    if project_absolute_path:
+        stop_opencode_daemon(process.pid, allocated_port=allocated_port, project_absolute_path=project_absolute_path)
+    else:
+        stop_opencode_daemon(process.pid, allocated_port=allocated_port)
+
+    raise DaemonStartError(
+        "OpenCode daemon failed to become ready "
+        f"within {timeout_seconds:.0f}s on port {allocated_port} "
+        f"(state={last_status.get('state')}, pid_alive={last_status.get('pid_alive')}, "
+        f"port_reachable={last_status.get('port_reachable')}, healthy={last_status.get('healthy')}, busy={last_status.get('busy')})."
+    )
+
+
 def _ensure_project_opencode_config(project_root: Path) -> None:
     destination = project_root / "opencode.json"
     if not destination.exists():
@@ -316,7 +347,7 @@ def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> su
         "; ".join(config_summary.get("warnings", [])) or "none",
     )
 
-    return subprocess.Popen(
+    process = subprocess.Popen(
         command,
         cwd=project_root,
         env=env,
@@ -325,6 +356,9 @@ def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> su
         text=False,
         start_new_session=True,
     )
+
+    wait_for_daemon_ready(process, allocated_port, project_absolute_path=str(project_root))
+    return process
 
 
 def allocate_available_port(start: int = 8010, end: int = 9000) -> int:
