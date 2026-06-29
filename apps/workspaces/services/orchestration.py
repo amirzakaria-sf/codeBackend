@@ -1,6 +1,7 @@
 import json
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from django.conf import settings
 from django.db import transaction
@@ -532,6 +533,7 @@ def perform_orchestration_run(run_id: int) -> dict:
 
 def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: OrchestrationRun) -> dict:
     client = OpenCodeClient(project.allocated_port)
+    allowed_worker_agents = _allowed_worker_agents()
 
     approved_plan_steps = list(
         run.plan_steps.filter(status=OrchestrationPlanStep.Status.APPROVED).order_by("sequence_order", "id"),
@@ -577,14 +579,15 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         session_id=run.plan_session_id,
         payload={"agent": plan_agent, "title": f"Plan {project.name}"},
     )
-    plan_response = client.prompt(run.plan_session_id, project.absolute_path, raw_prompt, plan_agent)
+    planner_prompt = _build_planner_prompt(raw_prompt=raw_prompt, allowed_worker_agents=allowed_worker_agents)
+    plan_response = client.prompt(run.plan_session_id, project.absolute_path, planner_prompt, plan_agent)
     record_artifact(
         run=run,
         artifact_type=OrchestrationArtifact.ArtifactType.MESSAGE,
         session_id=run.plan_session_id,
         label="plan-request",
-        content=raw_prompt,
-        payload={"agent": plan_agent},
+        content=planner_prompt,
+        payload={"agent": plan_agent, "requested_prompt": raw_prompt},
     )
     _capture_usage_with_fallback(
         client=client,
@@ -598,7 +601,12 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     )
     client.wait_for_idle(run.plan_session_id, project.absolute_path)
     _store_session_messages_artifact(client, run=run, session_id=run.plan_session_id, directory=project.absolute_path, label="plan-session-messages")
-    blueprint = extract_text_from_parts(plan_response.get("parts", []))
+    blueprint = _extract_response_text(
+        response_payload=plan_response,
+        client=client,
+        session_id=run.plan_session_id,
+        directory=project.absolute_path,
+    )
     if not blueprint:
         raise OrchestrationError("Plan agent returned an empty blueprint.")
     record_artifact(
@@ -637,7 +645,9 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     )
     supervisor_prompt = (
         "Convert the following blueprint into a strict JSON array of steps. "
-        "Each item must have keys: sequence_order, assigned_agent, instruction.\n\n"
+        "Each item must have keys: sequence_order, assigned_agent, instruction. "
+        f"The assigned_agent value MUST be exactly one of: {', '.join(allowed_worker_agents)}. "
+        "Return JSON only and do not include markdown fences or commentary.\n\n"
         f"Blueprint:\n{blueprint}"
     )
     supervisor_response = client.prompt(
@@ -666,10 +676,16 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     )
     client.wait_for_idle(run.supervisor_session_id, project.absolute_path)
     _store_session_messages_artifact(client, run=run, session_id=run.supervisor_session_id, directory=project.absolute_path, label="supervisor-session-messages")
-    supervisor_text = extract_text_from_parts(supervisor_response.get("parts", []))
+    supervisor_text = _extract_response_text(
+        response_payload=supervisor_response,
+        client=client,
+        session_id=run.supervisor_session_id,
+        directory=project.absolute_path,
+    )
     steps = _parse_supervisor_steps(supervisor_text)
     if not steps:
         raise OrchestrationError("Supervisor did not return a valid step list.")
+    steps = _coerce_step_agents(steps, allowed_worker_agents=allowed_worker_agents)
     record_artifact(
         run=run,
         artifact_type=OrchestrationArtifact.ArtifactType.STEP_LIST,
@@ -1324,6 +1340,105 @@ def _evaluate_run_outcome(run: OrchestrationRun) -> str:
     return ""
 
 
+def _allowed_worker_agents() -> list[str]:
+    raw = (getattr(settings, "ORCHESTRATION_ALLOWED_WORKER_AGENTS", "") or "").strip()
+    if not raw:
+        return ["build", "frontend-wizard", "db-expert", "code-reviewer", "explore", "scout", "general"]
+    return [agent.strip() for agent in raw.split(",") if agent.strip()]
+
+
+def _build_planner_prompt(*, raw_prompt: str, allowed_worker_agents: list[str]) -> str:
+    return (
+        "You are the planning agent for a multi-agent coding orchestrator. "
+        "Create a complete implementation blueprint for the user request.\n\n"
+        "Rules:\n"
+        "1) Always return a non-empty blueprint in plain text.\n"
+        "2) Include scope, architecture, ordered implementation phases, verification steps, and risk notes.\n"
+        "3) Be explicit enough that a supervisor can split work into executable agent tasks.\n"
+        f"4) Worker agents available in this system are: {', '.join(allowed_worker_agents)}.\n"
+        "5) Do not return JSON in this step.\n\n"
+        f"User request:\n{raw_prompt}"
+    )
+
+
+def _extract_text_from_message_item(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+
+    parts = item.get("parts")
+    if isinstance(parts, list):
+        text = extract_text_from_parts(parts)
+        if text:
+            return text
+
+    for key in ("text", "content", "message"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    content_value = item.get("content")
+    if isinstance(content_value, list):
+        for entry in content_value:
+            if isinstance(entry, dict):
+                text = str(entry.get("text") or "").strip()
+                if text:
+                    return text
+            elif isinstance(entry, str) and entry.strip():
+                return entry.strip()
+
+    return ""
+
+
+def _extract_response_text(*, response_payload: Any, client: OpenCodeClient, session_id: str, directory: str) -> str:
+    if isinstance(response_payload, dict):
+        parts = response_payload.get("parts")
+        if isinstance(parts, list):
+            text = extract_text_from_parts(parts)
+            if text:
+                return text
+
+        for key in ("text", "content", "message"):
+            value = response_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    try:
+        messages_payload = client.session_messages(session_id, directory)
+    except Exception:  # noqa: BLE001
+        return ""
+
+    if not isinstance(messages_payload, list):
+        return ""
+
+    for item in reversed(messages_payload):
+        text = _extract_text_from_message_item(item)
+        if text:
+            return text
+
+    return ""
+
+
+def _coerce_step_agents(steps: list[dict], *, allowed_worker_agents: list[str]) -> list[dict]:
+    allowed = {agent.strip() for agent in allowed_worker_agents if agent.strip()}
+    fallback_agent = (getattr(settings, "ORCHESTRATION_FALLBACK_WORKER_AGENT", "general") or "general").strip()
+    if fallback_agent not in allowed:
+        raise OrchestrationError("Configured ORCHESTRATION_FALLBACK_WORKER_AGENT is not present in ORCHESTRATION_ALLOWED_WORKER_AGENTS.")
+
+    normalized: list[dict] = []
+    for step in steps:
+        assigned_agent = str(step.get("assigned_agent") or "").strip()
+        if assigned_agent not in allowed:
+            assigned_agent = fallback_agent
+        normalized.append(
+            {
+                "sequence_order": step["sequence_order"],
+                "assigned_agent": assigned_agent,
+                "instruction": step["instruction"],
+            },
+        )
+    return normalized
+
+
 def _parse_supervisor_steps(supervisor_text: str) -> list[dict]:
     try:
         return _normalize_steps(json.loads(supervisor_text))
@@ -1353,11 +1468,17 @@ def _normalize_steps(payload: object) -> list[dict]:
         sequence_order = item.get("sequence_order") or item.get("step") or index
         if not assigned_agent or not instruction:
             continue
+        try:
+            normalized_order = int(sequence_order)
+        except (TypeError, ValueError):
+            normalized_order = index
+        if normalized_order <= 0:
+            normalized_order = index
         normalized_steps.append(
             {
-                "sequence_order": int(sequence_order),
-                "assigned_agent": str(assigned_agent),
-                "instruction": str(instruction),
+                "sequence_order": normalized_order,
+                "assigned_agent": str(assigned_agent).strip(),
+                "instruction": str(instruction).strip(),
             },
         )
     return normalized_steps

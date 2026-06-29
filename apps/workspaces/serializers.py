@@ -54,7 +54,15 @@ class ProjectSerializer(serializers.ModelSerializer):
 
     def get_storage_mode(self, obj: Project) -> str:
         configured = (getattr(settings, "MANAGED_PROJECTS_STORAGE_MODE", "") or "").strip()
-        return configured or "unknown"
+        if configured:
+            return configured
+        host_root = (getattr(settings, "MANAGED_PROJECTS_HOST_ROOT", "") or "").strip()
+        if host_root:
+            return "bind"
+        managed_root = (getattr(settings, "MANAGED_PROJECTS_ROOT", "") or "").strip()
+        if managed_root:
+            return "runtime-only"
+        return "unknown"
 
     class Meta:
         model = Project

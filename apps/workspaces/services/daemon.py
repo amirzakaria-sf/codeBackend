@@ -1,4 +1,5 @@
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -42,6 +43,49 @@ def project_root_from_path(project_absolute_path: str) -> Path:
     return project_root
 
 
+def _ensure_project_opencode_config(project_root: Path) -> None:
+    destination = project_root / "opencode.json"
+    if destination.exists():
+        return
+
+    template_path_raw = (getattr(settings, "GLOBAL_TEMPLATE_PATH", "") or "").strip()
+    if not template_path_raw:
+        return
+
+    template_path = Path(template_path_raw).expanduser().resolve()
+    if not template_path.exists() or not template_path.is_file():
+        raise DaemonStartError("GLOBAL_TEMPLATE_PATH does not point to a valid file.")
+
+    shutil.copy2(template_path, destination)
+
+
+def _docker_command(project_root: Path, allocated_port: int, opencode_binary: str, opencode_subcommand: str) -> list[str]:
+    image = (getattr(settings, "OPENCODE_DAEMON_DOCKER_IMAGE", "") or "").strip()
+    if not image:
+        raise DaemonStartError("OPENCODE_DAEMON_DOCKER_IMAGE must be configured when OPENCODE_DAEMON_SANDBOX_MODE=docker.")
+
+    container_workdir = (getattr(settings, "OPENCODE_DAEMON_CONTAINER_WORKDIR", "/workspace") or "/workspace").strip() or "/workspace"
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--init",
+        "-v",
+        f"{project_root}:{container_workdir}",
+        "-w",
+        container_workdir,
+        "-p",
+        f"127.0.0.1:{allocated_port}:{allocated_port}",
+        image,
+        opencode_binary,
+        opencode_subcommand,
+        "--port",
+        str(allocated_port),
+        "--hostname",
+        "0.0.0.0",
+    ]
+
+
 def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> subprocess.Popen:
     """
     Start an isolated OpenCode daemon for a project by injecting backend venv/bin
@@ -49,6 +93,7 @@ def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> su
     """
 
     project_root = project_root_from_path(project_absolute_path)
+    _ensure_project_opencode_config(project_root)
     venv_bin_path = _venv_bin_path(project_root)
     backend_venv = project_root / "backend" / "venv"
 
@@ -60,15 +105,19 @@ def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> su
 
     opencode_binary = settings.OPENCODE_BINARY_PATH
     opencode_subcommand = settings.OPENCODE_WEB_SUBCOMMAND
+    sandbox_mode = (getattr(settings, "OPENCODE_DAEMON_SANDBOX_MODE", "host") or "host").strip().lower()
 
-    command = [
-        opencode_binary,
-        opencode_subcommand,
-        "--port",
-        str(allocated_port),
-        "--hostname",
-        "127.0.0.1",
-    ]
+    if sandbox_mode == "docker":
+        command = _docker_command(project_root, allocated_port, opencode_binary, opencode_subcommand)
+    else:
+        command = [
+            opencode_binary,
+            opencode_subcommand,
+            "--port",
+            str(allocated_port),
+            "--hostname",
+            "127.0.0.1",
+        ]
 
     return subprocess.Popen(
         command,

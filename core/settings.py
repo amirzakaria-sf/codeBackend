@@ -209,6 +209,14 @@ OPENCODE_CIRCUIT_BREAKER_COOLDOWN_SECONDS = int(os.environ.get('OPENCODE_CIRCUIT
 PROJECT_COMPILE_COMMAND = os.environ.get('PROJECT_COMPILE_COMMAND', 'python -m compileall .')
 PLAN_AGENT_NAME = os.environ.get('PLAN_AGENT_NAME', 'plan')
 SUPERVISOR_AGENT_NAME = os.environ.get('SUPERVISOR_AGENT_NAME', 'supervisor')
+ORCHESTRATION_ALLOWED_WORKER_AGENTS = os.environ.get(
+    'ORCHESTRATION_ALLOWED_WORKER_AGENTS',
+    'build,frontend-wizard,db-expert,code-reviewer,explore,scout,general',
+)
+ORCHESTRATION_FALLBACK_WORKER_AGENT = os.environ.get('ORCHESTRATION_FALLBACK_WORKER_AGENT', 'general')
+OPENCODE_DAEMON_SANDBOX_MODE = os.environ.get('OPENCODE_DAEMON_SANDBOX_MODE', 'host').strip().lower()
+OPENCODE_DAEMON_DOCKER_IMAGE = os.environ.get('OPENCODE_DAEMON_DOCKER_IMAGE', '').strip()
+OPENCODE_DAEMON_CONTAINER_WORKDIR = os.environ.get('OPENCODE_DAEMON_CONTAINER_WORKDIR', '/workspace').strip() or '/workspace'
 DAEMON_WATCHDOG_ENABLED = os.environ.get('DAEMON_WATCHDOG_ENABLED', 'true').lower() == 'true'
 DAEMON_WATCHDOG_INTERVAL_SECONDS = int(os.environ.get('DAEMON_WATCHDOG_INTERVAL_SECONDS', '20'))
 STUCK_RUN_THRESHOLD_SECONDS = int(os.environ.get('STUCK_RUN_THRESHOLD_SECONDS', '180'))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+from celery.result import AsyncResult
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -23,6 +24,8 @@ ACTIVE_RUN_STATUSES = {
     OrchestrationRun.Status.VERIFYING,
 }
 
+TERMINAL_TASK_STATES = {"SUCCESS", "FAILURE", "REVOKED"}
+
 
 def scan_and_enqueue_stuck_runs() -> list[int]:
     threshold_seconds = max(30, settings.STUCK_RUN_THRESHOLD_SECONDS)
@@ -37,6 +40,8 @@ def scan_and_enqueue_stuck_runs() -> list[int]:
     from ..tasks import recover_stuck_run_task
 
     for run in candidates:
+        if _fail_and_unlock_if_orphaned(run, threshold_seconds=threshold_seconds):
+            continue
         task_result = recover_stuck_run_task.delay(run.id)
         run.celery_task_id = task_result.id
         run.current_phase = "Recovery scheduled"
@@ -45,6 +50,29 @@ def scan_and_enqueue_stuck_runs() -> list[int]:
         enqueued.append(run.id)
 
     return enqueued
+
+
+def _fail_and_unlock_if_orphaned(run: OrchestrationRun, *, threshold_seconds: int) -> bool:
+    task_id = (run.celery_task_id or "").strip()
+    if not task_id:
+        mark_run_failed(run, "Run is stuck without an active Celery task id.")
+        _unlock_project(run.project)
+        return True
+
+    task_state = AsyncResult(task_id).state
+    if task_state in TERMINAL_TASK_STATES:
+        mark_run_failed(run, f"Run task {task_id} ended in state '{task_state}' before orchestration reached a terminal run status.")
+        _unlock_project(run.project)
+        return True
+
+    if task_state == "PENDING":
+        stale_pending_cutoff = timezone.now() - timedelta(seconds=max(threshold_seconds * 2, threshold_seconds + 120))
+        if run.updated_at < stale_pending_cutoff:
+            mark_run_failed(run, "Run remained in pending Celery state beyond recovery timeout window.")
+            _unlock_project(run.project)
+            return True
+
+    return False
 
 
 def recover_stuck_run(run_id: int) -> dict:
@@ -83,7 +111,7 @@ def recover_stuck_run(run_id: int) -> dict:
             run.current_phase = f"Recovery attempt {attempt_number}: continue sent"
         else:
             _attempt_daemon_restart(run)
-        run.current_phase = f"Recovery attempt {attempt_number}: daemon restarted"
+            run.current_phase = f"Recovery attempt {attempt_number}: daemon restarted"
 
         run.save(update_fields=["current_phase", "updated_at"])
         record_run_activity(
