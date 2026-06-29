@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 from django.conf import settings
 
-from .provisioning import ProvisioningError, _validate_project_name
+from .provisioning import ProvisioningError, managed_projects_root
 
 
 class DaemonStartError(Exception):
@@ -28,14 +28,9 @@ def _venv_bin_path(project_root: Path) -> Path | None:
     return None
 
 
-def project_root_from_name(project_name: str) -> Path:
-    normalized_name = _validate_project_name(project_name)
-    managed_root_raw = settings.MANAGED_PROJECTS_ROOT
-    if not managed_root_raw:
-        raise ProvisioningError("MANAGED_PROJECTS_ROOT is not configured.")
-
-    managed_root = Path(managed_root_raw).expanduser().resolve()
-    project_root = (managed_root / normalized_name).resolve()
+def project_root_from_path(project_absolute_path: str) -> Path:
+    managed_root = managed_projects_root()
+    project_root = Path(project_absolute_path).expanduser().resolve()
 
     try:
         project_root.relative_to(managed_root)
@@ -47,13 +42,13 @@ def project_root_from_name(project_name: str) -> Path:
     return project_root
 
 
-def start_opencode_daemon(project_name: str, allocated_port: int) -> subprocess.Popen:
+def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> subprocess.Popen:
     """
     Start an isolated OpenCode daemon for a project by injecting backend venv/bin
     into PATH and binding server to localhost + allocated port.
     """
 
-    project_root = project_root_from_name(project_name)
+    project_root = project_root_from_path(project_absolute_path)
     venv_bin_path = _venv_bin_path(project_root)
     backend_venv = project_root / "backend" / "venv"
 

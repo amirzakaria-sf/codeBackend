@@ -17,12 +17,7 @@ class ProvisioningError(Exception):
 
 VALID_PROJECT_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 VALID_RELATIVE_PATH = re.compile(r"^[a-zA-Z0-9_./-]+$")
-VALID_GIT_REMOTE_PREFIXES = (
-    "https://",
-    "http://",
-    "ssh://",
-    "git@",
-)
+VALID_GITHUB_REMOTE_PREFIX = "https://github.com/"
 
 
 @dataclass(frozen=True)
@@ -39,6 +34,7 @@ class WorkspaceTargetSpec:
 
 @dataclass(frozen=True)
 class ProvisionWorkspaceRequest:
+    path_owner_username: str
     project_name: str
     workspace_mode: str
     starter_template: str
@@ -52,6 +48,7 @@ class ProvisionWorkspaceRequest:
 
 @dataclass(frozen=True)
 class ProvisionedWorkspace:
+    path_owner_username: str
     project_root: Path
     workspace_mode: str
     starter_template: str
@@ -71,12 +68,21 @@ def _validate_project_name(project_name: str) -> str:
     return normalized
 
 
+def normalize_path_owner_username(username: str) -> str:
+    normalized = username.strip().lower()
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-.")
+    if not normalized:
+        raise ProvisioningError("Authenticated user does not have a valid filesystem-safe username.")
+    return normalized
+
+
 def _validate_git_remote(remote_url: str) -> str:
     normalized = remote_url.strip()
     if not normalized:
         raise ProvisioningError("Git remote URL cannot be empty.")
-    if not normalized.startswith(VALID_GIT_REMOTE_PREFIXES):
-        raise ProvisioningError("Git remote URL must use https, http, ssh, or git@ syntax.")
+    if not normalized.startswith(VALID_GITHUB_REMOTE_PREFIX):
+        raise ProvisioningError("Only HTTPS GitHub remotes are supported for managed workspace provisioning.")
     return normalized
 
 
@@ -97,6 +103,47 @@ def _resolve_env_paths() -> tuple[Path, Path]:
 
     managed_root.mkdir(parents=True, exist_ok=True)
     return managed_root, template_path
+
+
+def _resolve_managed_root() -> Path:
+    managed_root_raw = settings.MANAGED_PROJECTS_ROOT
+    if not managed_root_raw:
+        raise ProvisioningError("MANAGED_PROJECTS_ROOT is not configured.")
+    managed_root = Path(managed_root_raw).expanduser().resolve()
+    managed_root.mkdir(parents=True, exist_ok=True)
+    return managed_root
+
+
+def managed_projects_root() -> Path:
+    return _resolve_managed_root()
+
+
+def managed_projects_host_root() -> Path | None:
+    host_root_raw = (getattr(settings, "MANAGED_PROJECTS_HOST_ROOT", "") or "").strip()
+    if not host_root_raw:
+        return None
+    return Path(host_root_raw).expanduser().resolve()
+
+
+def managed_project_relative_path(path_owner_username: str, project_name: str) -> Path:
+    normalized_owner = normalize_path_owner_username(path_owner_username)
+    normalized_project_name = _validate_project_name(project_name)
+    return Path(normalized_owner) / normalized_project_name
+
+
+def host_path_from_runtime_path(runtime_path: str) -> str:
+    host_root = managed_projects_host_root()
+    if host_root is None:
+        return ""
+
+    runtime_root = managed_projects_root()
+    resolved_runtime_path = Path(runtime_path).expanduser().resolve()
+    try:
+        relative_path = resolved_runtime_path.relative_to(runtime_root)
+    except ValueError as error:
+        raise ProvisioningError("Runtime path escapes MANAGED_PROJECTS_ROOT.") from error
+
+    return str((host_root / relative_path).resolve())
 
 
 def _venv_bin_directory(venv_path: Path) -> Path:
@@ -408,10 +455,16 @@ def _create_target_directory(project_root: Path, relative_path: str) -> Path:
 
 
 def provision_project_structure(request: ProvisionWorkspaceRequest) -> ProvisionedWorkspace:
+    normalized_owner = normalize_path_owner_username(request.path_owner_username)
     normalized_name = _validate_project_name(request.project_name)
     managed_root, template_path = _resolve_env_paths()
 
-    project_root = managed_root / normalized_name
+    owner_root = (managed_root / normalized_owner).resolve()
+    project_root = (owner_root / normalized_name).resolve()
+    try:
+        project_root.relative_to(managed_root)
+    except ValueError as error:
+        raise ProvisioningError("Resolved project root escapes MANAGED_PROJECTS_ROOT.") from error
     if project_root.exists():
         raise ProvisioningError(f"Project '{normalized_name}' already exists.")
 
@@ -419,7 +472,8 @@ def provision_project_structure(request: ProvisionWorkspaceRequest) -> Provision
     setup_status = _setup_status_for_request(request)
 
     try:
-        project_root.mkdir(parents=True, exist_ok=False)
+        owner_root.mkdir(parents=True, exist_ok=True)
+        project_root.mkdir(parents=False, exist_ok=False)
 
         if request.workspace_mode == Project.WorkspaceMode.ACTIVE_CLONE:
             primary_target = normalized_targets[0]
@@ -447,6 +501,7 @@ def provision_project_structure(request: ProvisionWorkspaceRequest) -> Provision
         raise
 
     return ProvisionedWorkspace(
+        path_owner_username=normalized_owner,
         project_root=project_root,
         workspace_mode=request.workspace_mode,
         starter_template=request.starter_template,

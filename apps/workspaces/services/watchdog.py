@@ -90,7 +90,7 @@ def _heal_projects() -> None:
         if project.daemon_pid:
             stop_opencode_daemon(project.daemon_pid)
 
-        process = start_opencode_daemon(project.name, project.allocated_port)
+        process = start_opencode_daemon(project.absolute_path, project.allocated_port)
         old_pid = project.daemon_pid
         project.daemon_pid = process.pid
         project.save(update_fields=["daemon_pid", "updated_at"])

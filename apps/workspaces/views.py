@@ -3,25 +3,30 @@ import uuid
 from pathlib import Path
 
 from django.db import transaction
+from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
-from rest_framework import permissions, status, viewsets
+from rest_framework import mixins, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from opencode_client import OpenCodeClient, OpenCodeClientError
-
-from django.db.models import Count, Sum
 from django.utils import timezone
 
-from .models import GitSyncJob, OrchestrationRun, Project, TaskQueue, TokenUsageEvent, UserNotification, WorkspaceTarget
+from .models import GitSyncJob, OrchestrationPlanStep, OrchestrationRun, Project, TaskQueue, TokenUsageEvent, UserNotification, WorkspaceTarget
 from .serializers import (
     AuditLogSerializer,
     ExecuteIdeaSerializer,
     GitSyncJobSerializer,
     LockAcquireSerializer,
+    OrchestrationArtifactSerializer,
+    OrchestrationPlanStepSerializer,
+    OrchestrationRunActivitySerializer,
     OrchestrationRunSerializer,
+    PlanApprovalSerializer,
+    PlanReplanSerializer,
+    PlanStepUpdateSerializer,
     PendingApprovalDecisionSerializer,
     PendingApprovalTaskSerializer,
     ProjectSerializer,
@@ -43,8 +48,10 @@ from .services.daemon import (
 )
 from .services.orchestration import (
     OrchestrationError,
+    approve_plan_for_run,
     approve_pending_task,
     execute_or_queue_project_prompt,
+    request_replan_for_run,
     reject_pending_task,
 )
 from .services.github_sync import retry_sync_job
@@ -52,6 +59,7 @@ from .services.provisioning import (
     ProvisionWorkspaceRequest,
     ProvisioningError,
     WorkspaceTargetSpec,
+    normalize_path_owner_username,
     provision_project_structure,
 )
 from .services.realtime import broadcast_project_event
@@ -95,10 +103,24 @@ ALLOWED_REFERENCE_EXTENSIONS = {
 MAX_REFERENCE_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
-class ProjectViewSet(viewsets.ModelViewSet):
-    queryset = Project.objects.all().select_related("locked_by").prefetch_related("targets")
+class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
+    queryset = Project.objects.all().select_related("locked_by", "owner").prefetch_related("targets")
     serializer_class = ProjectSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        queryset = Project.objects.all().select_related("locked_by", "owner").prefetch_related("targets")
+        user = getattr(self.request, "user", None)
+        if not user or user.is_anonymous:
+            return queryset.none()
+        if user.is_staff or user.is_superuser:
+            return queryset
+        return queryset.filter(owner=user)
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        return context
 
     def _require_lock_owner_or_admin(self, user, project: Project):
         if user.is_staff or user.is_superuser:
@@ -106,6 +128,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if project.locked_by_id == user.id:
             return
         raise PermissionDenied("Only the project lock owner or an admin can perform this action.")
+
+    def _require_plan_approver(self, user, project: Project, run: OrchestrationRun):
+        if user.is_staff or user.is_superuser:
+            return
+        if run.user_id == user.id:
+            return
+        if project.locked_by_id == user.id:
+            return
+        raise PermissionDenied("Only the run requester, lock owner, or an admin can approve or replan this draft plan.")
 
     @staticmethod
     def _build_opencode_client(project: Project) -> OpenCodeClient:
@@ -134,7 +165,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if not daemon_running or not health.get("reachable") or not health.get("healthy"):
             if project.daemon_pid:
                 stop_opencode_daemon(project.daemon_pid)
-            process = start_opencode_daemon(project.name, port)
+            process = start_opencode_daemon(project.absolute_path, port)
             project.daemon_pid = process.pid
             fields_to_update.extend(["daemon_pid", "updated_at"])
 
@@ -175,7 +206,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="lock-acquire", throttle_classes=[ProjectMutationThrottle])
     def lock_acquire(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         serializer = LockAcquireSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         force = serializer.validated_data["force"]
@@ -222,7 +253,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="lock-release", throttle_classes=[ProjectMutationThrottle])
     def lock_release(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
 
         if not project.is_locked:
             return Response(
@@ -260,6 +291,13 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer = ProvisionProjectSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         project_name = serializer.validated_data["name"]
+        normalized_owner_username = normalize_path_owner_username(request.user.username)
+
+        if Project.objects.filter(path_owner_username=normalized_owner_username, name=project_name).exists():
+            return Response(
+                {"detail": f"Project '{project_name}' already exists for this user."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         try:
             with transaction.atomic():
@@ -278,6 +316,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 )
                 provision_request = ProvisionWorkspaceRequest(
                     project_name=project_name,
+                    path_owner_username=request.user.username,
                     workspace_mode=serializer.validated_data["workspace_mode"],
                     starter_template=serializer.validated_data.get("starter_template", Project.StarterTemplate.FULLSTACK),
                     bootstrap_enabled=serializer.validated_data.get("bootstrap_enabled", False),
@@ -289,6 +328,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 )
                 provisioned_workspace = provision_project_structure(provision_request)
                 project = Project.objects.create(
+                    owner=request.user,
+                    path_owner_username=provisioned_workspace.path_owner_username,
                     name=project_name,
                     absolute_path=str(provisioned_workspace.project_root),
                     workspace_mode=provisioned_workspace.workspace_mode,
@@ -326,7 +367,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="start-daemon", throttle_classes=[ProjectMutationThrottle])
     def start_daemon(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = StartDaemonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -343,7 +384,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             )
 
         try:
-            process = start_opencode_daemon(project.name, allocated_port)
+            process = start_opencode_daemon(project.absolute_path, allocated_port)
         except (ProvisioningError, DaemonStartError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as error:  # noqa: BLE001
@@ -369,7 +410,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="stop-daemon", throttle_classes=[ProjectMutationThrottle])
     def stop_daemon(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         if not project.daemon_pid:
             return Response({"detail": "No daemon PID recorded for this project."}, status=status.HTTP_400_BAD_REQUEST)
@@ -391,7 +432,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="restart-daemon", throttle_classes=[ProjectMutationThrottle])
     def restart_daemon(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = StartDaemonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -400,7 +441,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
             stop_opencode_daemon(project.daemon_pid)
 
         allocated_port = serializer.validated_data.get("allocated_port") or project.allocated_port or allocate_available_port()
-        process = start_opencode_daemon(project.name, allocated_port)
+        process = start_opencode_daemon(project.absolute_path, allocated_port)
 
         project.allocated_port = allocated_port
         project.daemon_pid = process.pid
@@ -419,7 +460,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="daemon-status")
     def daemon_status(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         running = is_daemon_running(project.daemon_pid)
         health = daemon_health(project.allocated_port if running else None)
         return Response(
@@ -435,19 +476,19 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="tasks")
     def tasks(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         serializer = TaskQueueSerializer(project.tasks.select_related("user", "run").all(), many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["get"], url_path="audit")
     def audit(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         serializer = AuditLogSerializer(project.audit_logs.select_related("user").all(), many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="execute", throttle_classes=[ExecutePromptThrottle])
     def execute(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         serializer = ExecuteIdeaSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
@@ -458,6 +499,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
                 user=request.user,
                 prompt=serializer.validated_data["prompt"],
             )
+        except PermissionDenied as error:
+            return Response({"detail": str(error)}, status=status.HTTP_403_FORBIDDEN)
         except (ProvisioningError, DaemonStartError, OrchestrationError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as error:  # noqa: BLE001
@@ -470,10 +513,12 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="prepare-workspace", throttle_classes=[ProjectMutationThrottle])
     def prepare_workspace(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             prepared = self._ensure_runtime_ready(project, request.user)
-        except (ProvisioningError, DaemonStartError, PermissionDenied) as error:
+        except PermissionDenied as error:
+            return Response({"detail": str(error)}, status=status.HTTP_403_FORBIDDEN)
+        except (ProvisioningError, DaemonStartError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         except Exception as error:  # noqa: BLE001
             return Response({"detail": f"Unable to prepare workspace runtime: {error}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -494,7 +539,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         parser_classes=[MultiPartParser, FormParser],
     )
     def upload_reference(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         upload = request.FILES.get("file")
         if upload is None:
@@ -544,21 +589,103 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="runs")
     def runs(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
-        queryset = project.runs.select_related("user").prefetch_related("steps")
+        project = self.get_object()
+        queryset = project.runs.select_related("user").prefetch_related("steps", "plan_steps")
         serializer = OrchestrationRunSerializer(queryset, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["get"], url_path=r"runs/(?P<run_id>[^/.]+)")
     def run_detail(self, request, pk=None, run_id=None):
-        project = get_object_or_404(Project, pk=pk)
-        run = get_object_or_404(project.runs.select_related("user").prefetch_related("steps"), pk=run_id)
+        project = self.get_object()
+        run = get_object_or_404(
+            project.runs.select_related("user").prefetch_related("steps", "plan_steps", "activities", "artifacts"),
+            pk=run_id,
+        )
         serializer = OrchestrationRunSerializer(run)
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get"], url_path=r"runs/(?P<run_id>[^/.]+)/activities")
+    def run_activities(self, request, pk=None, run_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        serializer = OrchestrationRunActivitySerializer(run.activities.select_related("step", "task"), many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path=r"runs/(?P<run_id>[^/.]+)/artifacts")
+    def run_artifacts(self, request, pk=None, run_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        serializer = OrchestrationArtifactSerializer(run.artifacts.select_related("step", "task"), many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path=r"runs/(?P<run_id>[^/.]+)/plan")
+    def run_plan(self, request, pk=None, run_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        serializer = OrchestrationPlanStepSerializer(run.plan_steps.order_by("sequence_order", "id"), many=True)
+        return Response(
+            {
+                "run_id": run.id,
+                "status": run.status,
+                "approval_scope": run.approval_scope,
+                "complexity_level": run.complexity_level,
+                "plan_requires_approval": run.plan_requires_approval,
+                "plan_approved_at": run.plan_approved_at,
+                "steps": serializer.data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["patch"], url_path=r"runs/(?P<run_id>[^/.]+)/plan/(?P<step_id>[^/.]+)", throttle_classes=[ProjectMutationThrottle])
+    def run_plan_step_update(self, request, pk=None, run_id=None, step_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        self._require_plan_approver(request.user, project, run)
+        if run.status != OrchestrationRun.Status.AWAITING_PLAN_APPROVAL:
+            return Response({"detail": "Plan can only be edited while awaiting plan approval."}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = PlanStepUpdateSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        plan_step = get_object_or_404(run.plan_steps.filter(status=OrchestrationPlanStep.Status.DRAFT), pk=step_id)
+        update_fields = ["updated_at"]
+        for field in ("assigned_agent", "instruction_payload", "sequence_order"):
+            if field in serializer.validated_data:
+                setattr(plan_step, field, serializer.validated_data[field])
+                update_fields.append(field)
+        plan_step.save(update_fields=update_fields)
+        return Response(OrchestrationPlanStepSerializer(plan_step).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"runs/(?P<run_id>[^/.]+)/approve-plan", throttle_classes=[ProjectMutationThrottle])
+    def approve_plan(self, request, pk=None, run_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        self._require_plan_approver(request.user, project, run)
+        serializer = PlanApprovalSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if not serializer.validated_data.get("approved", True):
+            return Response({"detail": "Use the replan endpoint to request plan changes instead of approve=false."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            result = approve_plan_for_run(run, request.user)
+        except OrchestrationError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path=r"runs/(?P<run_id>[^/.]+)/replan", throttle_classes=[ProjectMutationThrottle])
+    def replan_run(self, request, pk=None, run_id=None):
+        project = self.get_object()
+        run = get_object_or_404(project.runs, pk=run_id)
+        self._require_plan_approver(request.user, project, run)
+        serializer = PlanReplanSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = request_replan_for_run(run, request.user, serializer.validated_data.get("feedback", ""))
+        except OrchestrationError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["get"], url_path="sessions")
     def sessions(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.sessions(project.absolute_path)
@@ -568,7 +695,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"sessions/(?P<session_id>[^/.]+)")
     def session_detail(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.session(session_id, project.absolute_path)
@@ -578,7 +705,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"sessions/(?P<session_id>[^/.]+)/messages")
     def session_messages(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.session_messages(session_id, project.absolute_path)
@@ -588,7 +715,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"sessions/(?P<session_id>[^/.]+)/diff")
     def session_diff(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.session_diff(session_id, project.absolute_path)
@@ -598,7 +725,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="sessions-status")
     def sessions_status(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.session_status(project.absolute_path)
@@ -608,7 +735,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="sessions-active")
     def sessions_active(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             sessions_payload = client.sessions(project.absolute_path)
@@ -647,14 +774,14 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="sync-jobs")
     def sync_jobs(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         queryset = project.git_sync_jobs.select_related("run", "user")
         serializer = GitSyncJobSerializer(queryset, many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path=r"sync-jobs/(?P<job_id>[^/.]+)/retry", throttle_classes=[ProjectMutationThrottle])
     def retry_sync(self, request, pk=None, job_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         job = get_object_or_404(project.git_sync_jobs, pk=job_id)
         retried = retry_sync_job(job)
@@ -662,7 +789,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="usage-summary")
     def usage_summary(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         runs = project.runs.all()
         usage_events = TokenUsageEvent.objects.filter(run__project=project)
         return Response(
@@ -680,7 +807,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"runs/(?P<run_id>[^/.]+)/usage-events")
     def run_usage_events(self, request, pk=None, run_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         run = get_object_or_404(project.runs, pk=run_id)
         serializer = TokenUsageEventSerializer(run.usage_events.all(), many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
@@ -708,9 +835,9 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="operations")
     def operations(self, request):
-        projects = Project.objects.prefetch_related("targets")
-        runs = OrchestrationRun.objects.select_related("project", "user")
-        sync_jobs = GitSyncJob.objects.select_related("project", "run", "user")
+        projects = self.get_queryset().prefetch_related("targets")
+        runs = OrchestrationRun.objects.select_related("project", "user").filter(project__in=projects)
+        sync_jobs = GitSyncJob.objects.select_related("project", "run", "user").filter(project__in=projects)
         notifications = UserNotification.objects.filter(user=request.user).select_related("project", "run")
 
         usage_totals = runs.aggregate(
@@ -732,6 +859,8 @@ class ProjectViewSet(viewsets.ModelViewSet):
                             OrchestrationRun.Status.QUEUED,
                             OrchestrationRun.Status.PLANNING,
                             OrchestrationRun.Status.BREAKING_DOWN,
+                            OrchestrationRun.Status.PLAN_READY,
+                            OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
                             OrchestrationRun.Status.RUNNING,
                             OrchestrationRun.Status.VERIFYING,
                         ],
@@ -743,7 +872,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     "prompt_tokens": usage_totals["prompt_tokens"] or 0,
                     "completion_tokens": usage_totals["completion_tokens"] or 0,
                     "total_tokens": usage_totals["total_tokens"] or 0,
-                    "usage_event_count": TokenUsageEvent.objects.count(),
+                    "usage_event_count": TokenUsageEvent.objects.filter(run__project__in=projects).count(),
                 },
                 "run_status_counts": dict(runs.values_list("status").annotate(count=Count("id"))),
                 "sync_status_counts": dict(sync_jobs.values_list("status").annotate(count=Count("id"))),
@@ -757,7 +886,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path=r"sessions/(?P<session_id>[^/.]+)/todos")
     def session_todos(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         try:
             client = self._build_opencode_client(project)
             payload = client.session_todos(session_id, project.absolute_path)
@@ -767,7 +896,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path=r"sessions/(?P<session_id>[^/.]+)/interrupt", throttle_classes=[ProjectMutationThrottle])
     def session_interrupt(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         try:
             client = self._build_opencode_client(project)
@@ -778,7 +907,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path=r"sessions/(?P<session_id>[^/.]+)/fork", throttle_classes=[ProjectMutationThrottle])
     def session_fork(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = SessionForkSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -796,7 +925,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path=r"sessions/(?P<session_id>[^/.]+)/summarize", throttle_classes=[ProjectMutationThrottle])
     def session_summarize(self, request, pk=None, session_id=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = SessionSummarizeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -815,13 +944,13 @@ class ProjectViewSet(viewsets.ModelViewSet):
     def approval_inbox(self, request):
         pending = TaskQueue.objects.filter(status=TaskQueue.Status.PENDING_APPROVAL).select_related("project", "user")
         if not (request.user.is_staff or request.user.is_superuser):
-            pending = pending.filter(project__locked_by=request.user)
+            pending = pending.filter(Q(project__owner=request.user) | Q(project__locked_by=request.user))
         serializer = PendingApprovalTaskSerializer(pending.order_by("created_at"), many=True)
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="approve-task", throttle_classes=[ProjectMutationThrottle])
     def approve_task(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = PendingApprovalDecisionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -836,7 +965,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="reject-task", throttle_classes=[ProjectMutationThrottle])
     def reject_task(self, request, pk=None):
-        project = get_object_or_404(Project, pk=pk)
+        project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         serializer = PendingApprovalDecisionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

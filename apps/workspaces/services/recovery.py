@@ -10,8 +10,9 @@ from opencode_client import OpenCodeClient, OpenCodeClientError
 
 from ..models import OrchestrationRun, Project, TaskQueue
 from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
-from .orchestration import mark_run_failed, send_run_status_event
+from .orchestration import mark_run_failed
 from .realtime import broadcast_project_event
+from .telemetry import record_run_activity, send_run_status_event
 
 
 ACTIVE_RUN_STATUSES = {
@@ -40,7 +41,7 @@ def scan_and_enqueue_stuck_runs() -> list[int]:
         run.celery_task_id = task_result.id
         run.current_phase = "Recovery scheduled"
         run.save(update_fields=["celery_task_id", "current_phase", "updated_at"])
-        send_run_status_event(run.project, run)
+        send_run_status_event(run.project.id, run)
         enqueued.append(run.id)
 
     return enqueued
@@ -65,7 +66,13 @@ def recover_stuck_run(run_id: int) -> dict:
     run.last_recovery_error = ""
     run.current_phase = f"Recovering stuck run (attempt {attempt_number}/{max_attempts})"
     run.save(update_fields=["stuck_recovery_count", "last_recovery_at", "last_recovery_error", "current_phase", "updated_at"])
-    send_run_status_event(run.project, run)
+    record_run_activity(
+        run=run,
+        kind="recovery.started",
+        message=run.current_phase,
+        payload={"attempt": attempt_number, "max_attempts": max_attempts},
+    )
+    send_run_status_event(run.project.id, run)
 
     try:
         if attempt_number == 1:
@@ -76,16 +83,29 @@ def recover_stuck_run(run_id: int) -> dict:
             run.current_phase = f"Recovery attempt {attempt_number}: continue sent"
         else:
             _attempt_daemon_restart(run)
-            run.current_phase = f"Recovery attempt {attempt_number}: daemon restarted"
+        run.current_phase = f"Recovery attempt {attempt_number}: daemon restarted"
 
         run.save(update_fields=["current_phase", "updated_at"])
-        send_run_status_event(run.project, run)
+        record_run_activity(
+            run=run,
+            kind="recovery.progress",
+            message=run.current_phase,
+            payload={"attempt": attempt_number},
+        )
+        send_run_status_event(run.project.id, run)
         return {"mode": "recovery_attempted", "run_id": run.id, "attempt": attempt_number}
     except Exception as error:  # noqa: BLE001
         run.last_recovery_error = str(error)
         run.current_phase = f"Recovery attempt {attempt_number} failed"
         run.save(update_fields=["last_recovery_error", "current_phase", "updated_at"])
-        send_run_status_event(run.project, run)
+        record_run_activity(
+            run=run,
+            kind="recovery.failed",
+            message=run.current_phase,
+            level="WARNING",
+            payload={"attempt": attempt_number, "error": str(error)},
+        )
+        send_run_status_event(run.project.id, run)
         if run.stuck_recovery_count >= max_attempts:
             mark_run_failed(run, f"Recovery attempts exhausted: {error}")
             _unlock_project(run.project)
@@ -119,7 +139,7 @@ def _attempt_daemon_restart(run: OrchestrationRun) -> None:
     if project.daemon_pid and is_daemon_running(project.daemon_pid):
         stop_opencode_daemon(project.daemon_pid)
 
-    process = start_opencode_daemon(project.name, project.allocated_port)
+    process = start_opencode_daemon(project.absolute_path, project.allocated_port)
     old_pid = project.daemon_pid
     project.daemon_pid = process.pid
     project.save(update_fields=["daemon_pid", "updated_at"])

@@ -8,11 +8,12 @@ from django.utils import timezone
 
 from opencode_client import OpenCodeClient, diff_to_text, extract_text_from_parts
 
-from ..models import AuditLog, OrchestrationRun, OrchestrationStep, Project, TaskQueue
+from ..models import AuditLog, OrchestrationArtifact, OrchestrationPlanStep, OrchestrationRun, OrchestrationRunActivity, OrchestrationStep, Project, TaskQueue
 from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
 from .github_sync import enqueue_github_sync_for_run
 from .notifications import create_user_notification
 from .realtime import broadcast_project_event, broadcast_user_event
+from .telemetry import record_artifact, record_run_activity, send_run_status_event, transition_run
 from .usage import capture_usage_event
 
 
@@ -38,6 +39,7 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
             project=project,
             user=user,
             prompt=prompt,
+            approval_scope=OrchestrationRun.ApprovalScope.LOCK,
             status=OrchestrationRun.Status.PENDING_APPROVAL,
             current_phase="Waiting for approval",
             progress_percent=0,
@@ -49,7 +51,22 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
             assigned_agent="supervisor",
             instruction_payload=prompt,
             sequence_order=1,
+            approval_scope=TaskQueue.ApprovalScope.LOCK,
             status=TaskQueue.Status.PENDING_APPROVAL,
+        )
+        record_run_activity(
+            run=queued_run,
+            kind="approval.lock_requested",
+            message=f"Prompt from {user.username} is waiting for lock approval.",
+            payload={"task_id": queued_task.id, "requested_by": user.username},
+        )
+        record_artifact(
+            run=queued_run,
+            task=queued_task,
+            artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+            label="lock-approval-request",
+            content=prompt,
+            payload={"requested_by": user.username, "scope": OrchestrationRun.ApprovalScope.LOCK},
         )
         broadcast_project_event(
             project.id,
@@ -81,7 +98,7 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
                 run=queued_run,
                 payload={"task_id": queued_task.id, "run_id": queued_run.id},
             )
-        send_run_status_event(project, queued_run)
+        send_run_status_event(project.id, queued_run)
         return {
             "mode": "queued_for_approval",
             "task_id": queued_task.id,
@@ -97,9 +114,16 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
             project=project,
             user=user,
             prompt=prompt,
+            approval_scope=OrchestrationRun.ApprovalScope.NONE,
             status=OrchestrationRun.Status.QUEUED,
             current_phase="Queued",
             progress_percent=5,
+        )
+        record_run_activity(
+            run=run,
+            kind="run.queued",
+            message="Run queued for background orchestration.",
+            payload={"requested_by": user.username},
         )
 
     broadcast_project_event(
@@ -111,7 +135,7 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
             "locked_by": user.username,
         },
     )
-    send_run_status_event(project, run)
+    send_run_status_event(project.id, run)
 
     try:
         task_result = _enqueue_run(run)
@@ -132,7 +156,7 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
         raise OrchestrationError(str(error)) from error
     run.celery_task_id = task_result.id
     run.save(update_fields=["celery_task_id", "updated_at"])
-    send_run_status_event(project, run)
+    send_run_status_event(project.id, run)
     return {
         "mode": "queued",
         "run_id": run.id,
@@ -162,14 +186,29 @@ def approve_pending_task(project: Project, task: TaskQueue, approver) -> dict:
         task.supervisor_feedback = f"Approved by {approver.username}."
         task.save(update_fields=["status", "supervisor_feedback", "updated_at"])
         run.user = requester
-        run.status = OrchestrationRun.Status.QUEUED
-        run.current_phase = "Queued"
-        run.progress_percent = max(run.progress_percent, 5)
-        run.last_error = ""
-        run.save(update_fields=["user", "status", "current_phase", "progress_percent", "last_error", "updated_at"])
+        run.approval_scope = OrchestrationRun.ApprovalScope.LOCK
+        run.save(update_fields=["user", "approval_scope", "updated_at"])
+
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.QUEUED,
+        current_phase="Queued",
+        progress_percent=max(run.progress_percent, 5),
+        last_error="",
+        activity_kind="approval.lock_approved",
+        activity_message=f"Lock approval granted by {approver.username}.",
+        activity_payload={"approver": approver.username, "requester": requester.username},
+    )
+    record_artifact(
+        run=run,
+        task=task,
+        artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+        label="lock-approval-approved",
+        content=task.supervisor_feedback,
+        payload={"approver": approver.username, "scope": TaskQueue.ApprovalScope.LOCK},
+    )
 
     _broadcast_task_status(project, task)
-    send_run_status_event(project, run)
     broadcast_project_event(
         project.id,
         {
@@ -199,7 +238,7 @@ def approve_pending_task(project: Project, task: TaskQueue, approver) -> dict:
         raise OrchestrationError(str(error)) from error
     run.celery_task_id = task_result.id
     run.save(update_fields=["celery_task_id", "updated_at"])
-    send_run_status_event(project, run)
+    send_run_status_event(project.id, run)
     return {
         "mode": "approved_and_enqueued",
         "approved_task_id": task.id,
@@ -223,14 +262,28 @@ def reject_pending_task(project: Project, task: TaskQueue, approver, reason: str
     task.save(update_fields=["status", "supervisor_feedback", "updated_at"])
     if task.run_id:
         OrchestrationRun.objects.filter(pk=task.run_id).update(
+            approval_scope=OrchestrationRun.ApprovalScope.LOCK,
+        )
+        task.run.refresh_from_db()
+        transition_run(
+            run=task.run,
             status=OrchestrationRun.Status.FAILED,
             current_phase="Rejected",
             last_error=task.supervisor_feedback,
-            finished_at=timezone.now(),
-            updated_at=timezone.now(),
+            finished=True,
+            activity_kind="approval.lock_rejected",
+            activity_message=task.supervisor_feedback,
+            activity_level=OrchestrationRunActivity.Level.WARNING,
+            activity_payload={"approver": approver.username, "reason": rejection_reason},
         )
-        task.run.refresh_from_db()
-        send_run_status_event(project, task.run)
+        record_artifact(
+            run=task.run,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+            label="lock-approval-rejected",
+            content=task.supervisor_feedback,
+            payload={"approver": approver.username, "scope": TaskQueue.ApprovalScope.LOCK},
+        )
     _broadcast_task_status(project, task)
 
     if task.user_id:
@@ -263,9 +316,107 @@ def reject_pending_task(project: Project, task: TaskQueue, approver, reason: str
     }
 
 
+def approve_plan_for_run(run: OrchestrationRun, approver) -> dict:
+    if run.status != OrchestrationRun.Status.AWAITING_PLAN_APPROVAL:
+        raise OrchestrationError("Run is not awaiting plan approval.")
+    if not run.plan_requires_approval:
+        raise OrchestrationError("Run does not require plan approval.")
+
+    draft_steps = list(run.plan_steps.filter(status=OrchestrationPlanStep.Status.DRAFT).order_by("sequence_order", "id"))
+    if not draft_steps:
+        raise OrchestrationError("Run does not have any draft plan steps to approve.")
+
+    OrchestrationPlanStep.objects.filter(run=run, status=OrchestrationPlanStep.Status.DRAFT).update(
+        status=OrchestrationPlanStep.Status.APPROVED,
+        updated_at=timezone.now(),
+    )
+    run.plan_requires_approval = False
+    run.approval_scope = OrchestrationRun.ApprovalScope.NONE
+    run.plan_approved_at = timezone.now()
+    run.save(update_fields=["plan_requires_approval", "approval_scope", "plan_approved_at", "updated_at"])
+
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.QUEUED,
+        current_phase="Plan approved and queued for execution",
+        progress_percent=max(run.progress_percent, 25),
+        activity_kind="plan.approved",
+        activity_message=f"Plan approved by {approver.username}.",
+        activity_payload={"approver": approver.username, "step_count": len(draft_steps)},
+    )
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+        label="plan-approved",
+        content=f"Approved by {approver.username}",
+        payload={"approver": approver.username, "scope": OrchestrationRun.ApprovalScope.PLAN},
+    )
+
+    task_result = _enqueue_run(run)
+    run.celery_task_id = task_result.id
+    run.save(update_fields=["celery_task_id", "updated_at"])
+    send_run_status_event(run.project_id, run)
+    return {
+        "mode": "plan_approved",
+        "run_id": run.id,
+        "celery_task_id": task_result.id,
+        "status": run.status,
+    }
+
+
+def request_replan_for_run(run: OrchestrationRun, requester, feedback: str = "") -> dict:
+    if run.status not in {OrchestrationRun.Status.AWAITING_PLAN_APPROVAL, OrchestrationRun.Status.PLAN_READY}:
+        raise OrchestrationError("Run is not currently in a replannable state.")
+
+    cleaned_feedback = feedback.strip()
+    if cleaned_feedback:
+        run.last_error = cleaned_feedback
+        run.save(update_fields=["last_error", "updated_at"])
+
+    OrchestrationPlanStep.objects.filter(run=run, status__in=[OrchestrationPlanStep.Status.DRAFT, OrchestrationPlanStep.Status.APPROVED]).update(
+        status=OrchestrationPlanStep.Status.REPLACED,
+        updated_at=timezone.now(),
+    )
+    run.plan_requires_approval = False
+    run.plan_approved_at = None
+    run.approval_scope = OrchestrationRun.ApprovalScope.NONE
+    run.save(update_fields=["plan_requires_approval", "plan_approved_at", "approval_scope", "updated_at"])
+
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.QUEUED,
+        current_phase="Queued for replanning",
+        progress_percent=10,
+        last_error=cleaned_feedback,
+        activity_kind="plan.replan_requested",
+        activity_message=cleaned_feedback or f"Replan requested by {requester.username}.",
+        activity_level=OrchestrationRunActivity.Level.WARNING,
+        activity_payload={"requested_by": requester.username},
+    )
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+        label="plan-replan-request",
+        content=cleaned_feedback,
+        payload={"requested_by": requester.username, "scope": OrchestrationRun.ApprovalScope.PLAN},
+    )
+
+    task_result = _enqueue_run(run)
+    run.celery_task_id = task_result.id
+    run.save(update_fields=["celery_task_id", "updated_at"])
+    send_run_status_event(run.project_id, run)
+    return {
+        "mode": "plan_replan_requested",
+        "run_id": run.id,
+        "celery_task_id": task_result.id,
+        "status": run.status,
+    }
+
+
 def perform_orchestration_run(run_id: int) -> dict:
     run = OrchestrationRun.objects.select_related("project", "user").get(pk=run_id)
     if run.status == OrchestrationRun.Status.CANCELLED:
+        record_run_activity(run=run, kind="run.cancelled", message="Run was cancelled before execution started.")
         return {"mode": "cancelled", "run_id": run.id}
 
     if not run.project.allocated_port:
@@ -277,21 +428,30 @@ def perform_orchestration_run(run_id: int) -> dict:
     if not daemon_running or not health.get("reachable") or not health.get("healthy"):
         if run.project.daemon_pid:
             stop_opencode_daemon(run.project.daemon_pid)
-        process = start_opencode_daemon(run.project.name, int(run.project.allocated_port))
+        process = start_opencode_daemon(run.project.absolute_path, int(run.project.allocated_port))
         run.project.daemon_pid = process.pid
         run.project.save(update_fields=["daemon_pid", "updated_at"])
+        record_run_activity(
+            run=run,
+            kind="daemon.restarted",
+            message="Daemon restarted before orchestration execution.",
+            payload={"daemon_pid": process.pid, "allocated_port": run.project.allocated_port},
+        )
 
     if not run.user_id:
         mark_run_failed(run, "Run has no associated requesting user.")
         raise OrchestrationError("Run has no associated requesting user.")
 
-    run.status = OrchestrationRun.Status.PLANNING
-    run.current_phase = "Planning"
-    run.progress_percent = max(run.progress_percent, 10)
-    run.started_at = run.started_at or timezone.now()
-    run.last_error = ""
-    run.save(update_fields=["status", "current_phase", "progress_percent", "started_at", "last_error", "updated_at"])
-    send_run_status_event(run.project, run)
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.PLANNING,
+        current_phase="Planning",
+        progress_percent=max(run.progress_percent, 10),
+        last_error="",
+        started=True,
+        activity_kind="run.planning_started",
+        activity_message="Planning orchestration run.",
+    )
 
     try:
         result = run_orchestration_cycle(project=run.project, user=run.user, raw_prompt=run.prompt, run=run)
@@ -311,12 +471,36 @@ def perform_orchestration_run(run_id: int) -> dict:
         )
         raise
 
-    run.status = OrchestrationRun.Status.COMPLETED
-    run.current_phase = "Completed"
-    run.progress_percent = 100
-    run.finished_at = timezone.now()
-    run.save(update_fields=["status", "current_phase", "progress_percent", "finished_at", "updated_at"])
-    send_run_status_event(run.project, run)
+    run.refresh_from_db(fields=["total_steps", "completed_steps", "failed_steps", "progress_percent", "current_phase", "status", "updated_at"])
+    if run.status in {OrchestrationRun.Status.AWAITING_PLAN_APPROVAL, OrchestrationRun.Status.PLAN_READY}:
+        return result
+    outcome_error = _evaluate_run_outcome(run)
+    if outcome_error:
+        mark_run_failed(run, outcome_error)
+        run.project.is_locked = False
+        run.project.locked_by = None
+        run.project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        broadcast_project_event(
+            run.project.id,
+            {
+                "kind": "lock_status_changed",
+                "project_id": run.project.id,
+                "is_locked": False,
+                "locked_by": None,
+            },
+        )
+        raise OrchestrationError(outcome_error)
+
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.COMPLETED,
+        current_phase="Completed",
+        progress_percent=100,
+        finished=True,
+        activity_kind="run.completed",
+        activity_message=f"Completed {run.completed_steps} of {run.total_steps} steps.",
+        activity_payload={"completed_steps": run.completed_steps, "failed_steps": run.failed_steps, "total_steps": run.total_steps},
+    )
 
     run.project.is_locked = False
     run.project.locked_by = None
@@ -349,6 +533,36 @@ def perform_orchestration_run(run_id: int) -> dict:
 def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: OrchestrationRun) -> dict:
     client = OpenCodeClient(project.allocated_port)
 
+    approved_plan_steps = list(
+        run.plan_steps.filter(status=OrchestrationPlanStep.Status.APPROVED).order_by("sequence_order", "id"),
+    )
+    if approved_plan_steps and not run.plan_requires_approval:
+        transition_run(
+            run=run,
+            status=OrchestrationRun.Status.RUNNING,
+            current_phase=f"Running {len(approved_plan_steps)} approved plan steps",
+            progress_percent=max(run.progress_percent, 25),
+            activity_kind="plan.execution_resumed",
+            activity_message="Executing previously approved plan.",
+            activity_payload={"step_count": len(approved_plan_steps)},
+        )
+        return _execute_planned_steps(
+            client=client,
+            project=project,
+            user=user,
+            raw_prompt=raw_prompt,
+            run=run,
+            steps=[
+                {
+                    "sequence_order": plan_step.sequence_order,
+                    "assigned_agent": plan_step.assigned_agent,
+                    "instruction": plan_step.instruction_payload,
+                }
+                for plan_step in approved_plan_steps
+            ],
+            plan_origin="approved",
+        )
+
     plan_agent = settings.PLAN_AGENT_NAME
     supervisor_agent = settings.SUPERVISOR_AGENT_NAME
 
@@ -356,20 +570,55 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     run.plan_session_id = plan_session["id"]
     run.active_session_id = plan_session["id"]
     run.save(update_fields=["plan_session_id", "active_session_id", "updated_at"])
-    send_run_status_event(project, run)
+    record_run_activity(
+        run=run,
+        kind="session.created",
+        message="Planning session created.",
+        session_id=run.plan_session_id,
+        payload={"agent": plan_agent, "title": f"Plan {project.name}"},
+    )
     plan_response = client.prompt(run.plan_session_id, project.absolute_path, raw_prompt, plan_agent)
-    capture_usage_event(run=run, session_id=run.plan_session_id, endpoint="session.message", payload=plan_response)
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.MESSAGE,
+        session_id=run.plan_session_id,
+        label="plan-request",
+        content=raw_prompt,
+        payload={"agent": plan_agent},
+    )
+    _capture_usage_with_fallback(
+        client=client,
+        run=run,
+        session_id=run.plan_session_id,
+        directory=project.absolute_path,
+        endpoint="session.message",
+        payload=plan_response,
+        step=None,
+        task=None,
+    )
     client.wait_for_idle(run.plan_session_id, project.absolute_path)
+    _store_session_messages_artifact(client, run=run, session_id=run.plan_session_id, directory=project.absolute_path, label="plan-session-messages")
     blueprint = extract_text_from_parts(plan_response.get("parts", []))
     if not blueprint:
         raise OrchestrationError("Plan agent returned an empty blueprint.")
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.PLAN,
+        session_id=run.plan_session_id,
+        label="blueprint",
+        content=blueprint,
+    )
 
     run.blueprint = blueprint
-    run.status = OrchestrationRun.Status.BREAKING_DOWN
-    run.current_phase = "Breaking tasks down"
-    run.progress_percent = max(run.progress_percent, 20)
-    run.save(update_fields=["blueprint", "status", "current_phase", "progress_percent", "updated_at"])
-    send_run_status_event(project, run)
+    run.save(update_fields=["blueprint", "updated_at"])
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.BREAKING_DOWN,
+        current_phase="Breaking tasks down",
+        progress_percent=max(run.progress_percent, 20),
+        activity_kind="run.breakdown_started",
+        activity_message="Supervisor is breaking the blueprint into executable steps.",
+    )
 
     supervisor_session = client.create_session(
         project.absolute_path,
@@ -379,7 +628,13 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     run.supervisor_session_id = supervisor_session["id"]
     run.active_session_id = supervisor_session["id"]
     run.save(update_fields=["supervisor_session_id", "active_session_id", "updated_at"])
-    send_run_status_event(project, run)
+    record_run_activity(
+        run=run,
+        kind="session.created",
+        message="Supervisor session created.",
+        session_id=run.supervisor_session_id,
+        payload={"agent": supervisor_agent, "title": f"Supervisor {project.name}"},
+    )
     supervisor_prompt = (
         "Convert the following blueprint into a strict JSON array of steps. "
         "Each item must have keys: sequence_order, assigned_agent, instruction.\n\n"
@@ -391,21 +646,167 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         supervisor_prompt,
         supervisor_agent,
     )
-    capture_usage_event(run=run, session_id=run.supervisor_session_id, endpoint="session.message", payload=supervisor_response)
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.MESSAGE,
+        session_id=run.supervisor_session_id,
+        label="supervisor-step-request",
+        content=supervisor_prompt,
+        payload={"agent": supervisor_agent},
+    )
+    _capture_usage_with_fallback(
+        client=client,
+        run=run,
+        session_id=run.supervisor_session_id,
+        directory=project.absolute_path,
+        endpoint="session.message",
+        payload=supervisor_response,
+        step=None,
+        task=None,
+    )
     client.wait_for_idle(run.supervisor_session_id, project.absolute_path)
+    _store_session_messages_artifact(client, run=run, session_id=run.supervisor_session_id, directory=project.absolute_path, label="supervisor-session-messages")
     supervisor_text = extract_text_from_parts(supervisor_response.get("parts", []))
     steps = _parse_supervisor_steps(supervisor_text)
     if not steps:
         raise OrchestrationError("Supervisor did not return a valid step list.")
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.STEP_LIST,
+        session_id=run.supervisor_session_id,
+        label="supervisor-steps",
+        content=supervisor_text,
+        payload={"steps": steps},
+    )
 
+    OrchestrationPlanStep.objects.filter(run=run, status__in=[OrchestrationPlanStep.Status.DRAFT, OrchestrationPlanStep.Status.APPROVED]).update(
+        status=OrchestrationPlanStep.Status.REPLACED,
+        updated_at=timezone.now(),
+    )
+    plan_step_rows = [
+        OrchestrationPlanStep(
+            run=run,
+            sequence_order=step["sequence_order"],
+            assigned_agent=step["assigned_agent"],
+            instruction_payload=step["instruction"],
+            status=OrchestrationPlanStep.Status.DRAFT,
+        )
+        for step in steps
+    ]
+    OrchestrationPlanStep.objects.bulk_create(plan_step_rows)
+
+    complexity = _classify_plan(steps)
     run.total_steps = len(steps)
     run.completed_steps = 0
     run.failed_steps = 0
-    run.status = OrchestrationRun.Status.RUNNING
-    run.current_phase = f"Running {len(steps)} steps"
-    run.progress_percent = max(run.progress_percent, 25)
-    run.save(update_fields=["total_steps", "completed_steps", "failed_steps", "status", "current_phase", "progress_percent", "updated_at"])
-    send_run_status_event(project, run)
+    run.complexity_level = complexity["level"]
+    run.plan_requires_approval = complexity["requires_approval"]
+    run.approval_scope = OrchestrationRun.ApprovalScope.PLAN if complexity["requires_approval"] else OrchestrationRun.ApprovalScope.NONE
+    run.plan_approved_at = None if complexity["requires_approval"] else timezone.now()
+    run.save(
+        update_fields=[
+            "total_steps",
+            "completed_steps",
+            "failed_steps",
+            "complexity_level",
+            "plan_requires_approval",
+            "approval_scope",
+            "plan_approved_at",
+            "updated_at",
+        ],
+    )
+    record_run_activity(
+        run=run,
+        kind="plan.generated",
+        message=f"Generated {len(steps)} draft plan steps.",
+        payload={"complexity": complexity},
+    )
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.APPROVAL,
+        label="plan-complexity",
+        payload=complexity,
+    )
+
+    if complexity["requires_approval"]:
+        transition_run(
+            run=run,
+            status=OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
+            current_phase="Awaiting plan approval",
+            progress_percent=max(run.progress_percent, 25),
+            activity_kind="plan.awaiting_approval",
+            activity_message="Generated plan requires approval before execution.",
+            activity_payload=complexity,
+        )
+        return {
+            "mode": "awaiting_plan_approval",
+            "run_id": run.id,
+            "blueprint": blueprint,
+            "steps": [
+                {
+                    "sequence_order": step["sequence_order"],
+                    "assigned_agent": step["assigned_agent"],
+                    "instruction": step["instruction"],
+                }
+                for step in steps
+            ],
+            "complexity": complexity,
+        }
+
+    OrchestrationPlanStep.objects.filter(run=run, status=OrchestrationPlanStep.Status.DRAFT).update(
+        status=OrchestrationPlanStep.Status.APPROVED,
+        updated_at=timezone.now(),
+    )
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.RUNNING,
+        current_phase=f"Running {len(steps)} auto-approved steps",
+        progress_percent=max(run.progress_percent, 25),
+        activity_kind="plan.auto_approved",
+        activity_message="Plan was auto-approved and execution is starting.",
+        activity_payload=complexity,
+    )
+
+    return _execute_planned_steps(
+        client=client,
+        project=project,
+        user=user,
+        raw_prompt=raw_prompt,
+        run=run,
+        steps=steps,
+        plan_origin="auto_approved",
+        blueprint=blueprint,
+    )
+
+
+def _execute_planned_steps(
+    *,
+    client: OpenCodeClient,
+    project: Project,
+    user,
+    raw_prompt: str,
+    run: OrchestrationRun,
+    steps: list[dict],
+    plan_origin: str,
+    blueprint: str = "",
+) -> dict:
+    supervisor_agent = settings.SUPERVISOR_AGENT_NAME
+    if not run.supervisor_session_id:
+        supervisor_session = client.create_session(
+            project.absolute_path,
+            f"Supervisor {project.name}",
+            supervisor_agent,
+        )
+        run.supervisor_session_id = supervisor_session["id"]
+        run.active_session_id = supervisor_session["id"]
+        run.save(update_fields=["supervisor_session_id", "active_session_id", "updated_at"])
+        record_run_activity(
+            run=run,
+            kind="session.created",
+            message="Supervisor session created for execution stage.",
+            session_id=run.supervisor_session_id,
+            payload={"agent": supervisor_agent},
+        )
 
     results: list[dict] = []
     for step in steps:
@@ -433,13 +834,52 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         run.current_phase = f"Completed {run.completed_steps} of {run.total_steps} steps"
         run.progress_percent = _progress_for_run(run)
         run.save(update_fields=["completed_steps", "failed_steps", "current_phase", "progress_percent", "updated_at"])
-        send_run_status_event(project, run)
+        record_run_activity(
+            run=run,
+            kind="run.progress",
+            message=run.current_phase,
+            payload={"completed_steps": run.completed_steps, "failed_steps": run.failed_steps, "total_steps": run.total_steps},
+        )
+        send_run_status_event(project.id, run)
 
     return {
         "mode": "executed",
         "run_id": run.id,
         "blueprint": blueprint,
+        "plan_origin": plan_origin,
         "steps": results,
+    }
+
+
+def _classify_plan(steps: list[dict]) -> dict:
+    reasons: list[str] = []
+    assigned_agents = {str(step.get("assigned_agent", "")).strip() for step in steps if step.get("assigned_agent")}
+    instructions = "\n".join(str(step.get("instruction", "")) for step in steps)
+    lowered = instructions.lower()
+
+    if len(steps) > 5:
+        reasons.append("step_count_gt_5")
+    if len(assigned_agents) > 1:
+        reasons.append("multiple_specialized_agents")
+    if any(keyword in lowered for keyword in ["migration", "database", "schema"]):
+        reasons.append("database_change")
+    if any(keyword in lowered for keyword in ["auth", "jwt", "permission", "security"]):
+        reasons.append("auth_or_security_change")
+    if any(keyword in lowered for keyword in ["deploy", "docker", "nginx", "infra", "daemon"]):
+        reasons.append("infra_change")
+    if any(keyword in lowered for keyword in ["delete all", "drop", "remove all", "wipe", "destroy"]):
+        reasons.append("destructive_operation")
+    if any(keyword in lowered for keyword in ["github repo", "create repo", "origin", "bootstrap git", "main branch", "dev branch"]):
+        reasons.append("repo_bootstrap")
+
+    requires_approval = bool(reasons)
+    level = OrchestrationRun.ComplexityLevel.COMPLEX if requires_approval else OrchestrationRun.ComplexityLevel.SIMPLE
+    return {
+        "level": level,
+        "requires_approval": requires_approval,
+        "reasons": reasons,
+        "step_count": len(steps),
+        "agent_count": len(assigned_agents),
     }
 
 
@@ -460,6 +900,7 @@ def _execute_step(
         assigned_agent=step["assigned_agent"],
         instruction_payload=step["instruction"],
         sequence_order=step["sequence_order"],
+        approval_scope=TaskQueue.ApprovalScope.NONE,
         status=TaskQueue.Status.QUEUED,
     )
     step_record = OrchestrationStep.objects.create(
@@ -470,8 +911,16 @@ def _execute_step(
         instruction_payload=step["instruction"],
         status=TaskQueue.Status.QUEUED,
     )
+    record_run_activity(
+        run=run,
+        step=step_record,
+        task=task,
+        kind="step.queued",
+        message=f"Queued step {step['sequence_order']} for @{step['assigned_agent']}.",
+        payload={"instruction": step["instruction"], "assigned_agent": step["assigned_agent"]},
+    )
     _broadcast_task_status(project, task)
-    send_run_status_event(project, run)
+    send_run_status_event(project.id, run)
 
     worker_session = client.create_session(
         project.absolute_path,
@@ -483,7 +932,16 @@ def _execute_step(
     step_record.save(update_fields=["worker_session_id", "updated_at"])
     run.active_session_id = worker_session_id
     run.save(update_fields=["active_session_id", "updated_at"])
-    send_run_status_event(project, run)
+    record_run_activity(
+        run=run,
+        step=step_record,
+        task=task,
+        kind="session.created",
+        message=f"Worker session created for step {step['sequence_order']}.",
+        session_id=worker_session_id,
+        payload={"agent": step["assigned_agent"]},
+    )
+    send_run_status_event(project.id, run)
 
     max_attempts = 3
     feedback = ""
@@ -497,35 +955,80 @@ def _execute_step(
         step_record.attempt_count = attempt
         step_record.supervisor_feedback = feedback
         step_record.save(update_fields=["status", "attempt_count", "supervisor_feedback", "updated_at"])
-        run.status = OrchestrationRun.Status.RUNNING
-        run.current_phase = f"Running step {step['sequence_order']}"
-        run.progress_percent = _progress_for_run(run, active_step=step["sequence_order"], verifying=False)
-        run.save(update_fields=["status", "current_phase", "progress_percent", "updated_at"])
+        transition_run(
+            run=run,
+            status=OrchestrationRun.Status.RUNNING,
+            current_phase=f"Running step {step['sequence_order']}",
+            progress_percent=_progress_for_run(run, active_step=step["sequence_order"], verifying=False),
+            activity_kind="step.running",
+            activity_message=f"Running step {step['sequence_order']} attempt {attempt}.",
+            activity_payload={"sequence_order": step["sequence_order"], "assigned_agent": step["assigned_agent"], "attempt": attempt},
+        )
         _broadcast_task_status(project, task)
-        send_run_status_event(project, run)
 
         instruction = step["instruction"]
         if feedback:
             instruction = f"{instruction}\n\nSupervisor feedback to fix before finishing:\n{feedback}"
+        record_artifact(
+            run=run,
+            step=step_record,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.MESSAGE,
+            session_id=worker_session_id,
+            label=f"worker-instruction-attempt-{attempt}",
+            content=instruction,
+            payload={"attempt": attempt, "assigned_agent": step["assigned_agent"]},
+        )
 
         worker_response = client.prompt(worker_session_id, project.absolute_path, instruction, step["assigned_agent"])
-        capture_usage_event(run=run, session_id=worker_session_id, endpoint="session.message", payload=worker_response)
+        _capture_usage_with_fallback(
+            client=client,
+            run=run,
+            session_id=worker_session_id,
+            directory=project.absolute_path,
+            endpoint="session.message",
+            payload=worker_response,
+            step=step_record,
+            task=task,
+        )
         client.wait_for_idle(worker_session_id, project.absolute_path)
+        _store_session_messages_artifact(
+            client,
+            run=run,
+            step=step_record,
+            task=task,
+            session_id=worker_session_id,
+            directory=project.absolute_path,
+            label=f"worker-session-messages-attempt-{attempt}",
+        )
 
         task.status = TaskQueue.Status.VERIFYING
         task.save(update_fields=["status", "updated_at"])
         step_record.status = TaskQueue.Status.VERIFYING
         step_record.save(update_fields=["status", "updated_at"])
-        run.status = OrchestrationRun.Status.VERIFYING
-        run.current_phase = f"Verifying step {step['sequence_order']}"
-        run.progress_percent = _progress_for_run(run, active_step=step["sequence_order"], verifying=True)
-        run.save(update_fields=["status", "current_phase", "progress_percent", "updated_at"])
+        transition_run(
+            run=run,
+            status=OrchestrationRun.Status.VERIFYING,
+            current_phase=f"Verifying step {step['sequence_order']}",
+            progress_percent=_progress_for_run(run, active_step=step["sequence_order"], verifying=True),
+            activity_kind="step.verifying",
+            activity_message=f"Supervisor reviewing step {step['sequence_order']} attempt {attempt}.",
+            activity_payload={"sequence_order": step["sequence_order"], "attempt": attempt},
+        )
         _broadcast_task_status(project, task)
-        send_run_status_event(project, run)
 
         generated_diff = diff_to_text(client.session_diff(worker_session_id, project.absolute_path))
         step_record.generated_diff = generated_diff
         step_record.save(update_fields=["generated_diff", "updated_at"])
+        record_artifact(
+            run=run,
+            step=step_record,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.DIFF,
+            session_id=worker_session_id,
+            label=f"worker-diff-attempt-{attempt}",
+            content=generated_diff,
+        )
         validation_feedback = _validate_step_with_supervisor(
             client=client,
             supervisor_session_id=supervisor_session_id,
@@ -534,12 +1037,24 @@ def _execute_step(
             step=step,
             generated_diff=generated_diff,
             run=run,
+            step_record=step_record,
+            task_record=task,
         )
         if validation_feedback == "APPROVED":
-            client.run_shell_command(
+            shell_payload = client.run_shell_command(
                 worker_session_id,
                 project.absolute_path,
                 settings.PROJECT_COMPILE_COMMAND,
+            )
+            record_artifact(
+                run=run,
+                step=step_record,
+                task=task,
+                artifact_type=OrchestrationArtifact.ArtifactType.SHELL_OUTPUT,
+                session_id=worker_session_id,
+                label="compile-command",
+                content=settings.PROJECT_COMPILE_COMMAND,
+                payload=shell_payload or {},
             )
             task.status = TaskQueue.Status.COMPLETED
             task.supervisor_feedback = "APPROVED"
@@ -552,6 +1067,16 @@ def _execute_step(
                 user=user,
                 original_prompt=original_prompt,
                 generated_diff=generated_diff,
+            )
+            record_run_activity(
+                run=run,
+                step=step_record,
+                task=task,
+                kind="step.completed",
+                message=f"Step {step['sequence_order']} approved.",
+                session_id=worker_session_id,
+                attempt_count=attempt,
+                payload={"assigned_agent": step["assigned_agent"]},
             )
             _broadcast_task_status(project, task)
             return StepResult(
@@ -567,6 +1092,26 @@ def _execute_step(
         task.save(update_fields=["supervisor_feedback", "updated_at"])
         step_record.supervisor_feedback = validation_feedback
         step_record.save(update_fields=["supervisor_feedback", "updated_at"])
+        record_artifact(
+            run=run,
+            step=step_record,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.SUPERVISOR_FEEDBACK,
+            session_id=supervisor_session_id,
+            label=f"supervisor-feedback-attempt-{attempt}",
+            content=validation_feedback,
+        )
+        record_run_activity(
+            run=run,
+            step=step_record,
+            task=task,
+            kind="step.retry_requested",
+            message=validation_feedback,
+            level=OrchestrationRunActivity.Level.WARNING,
+            session_id=supervisor_session_id,
+            attempt_count=attempt,
+            payload={"sequence_order": step["sequence_order"], "assigned_agent": step["assigned_agent"]},
+        )
 
         if attempt == max_attempts:
             break
@@ -577,6 +1122,26 @@ def _execute_step(
     step_record.status = TaskQueue.Status.FAILED
     step_record.supervisor_feedback = task.supervisor_feedback
     step_record.save(update_fields=["status", "supervisor_feedback", "updated_at"])
+    record_run_activity(
+        run=run,
+        step=step_record,
+        task=task,
+        kind="step.failed",
+        message=task.supervisor_feedback,
+        level=OrchestrationRunActivity.Level.ERROR,
+        session_id=worker_session_id,
+        attempt_count=step_record.attempt_count,
+        payload={"sequence_order": step["sequence_order"], "assigned_agent": step["assigned_agent"]},
+    )
+    record_artifact(
+        run=run,
+        step=step_record,
+        task=task,
+        artifact_type=OrchestrationArtifact.ArtifactType.ERROR,
+        session_id=worker_session_id,
+        label="step-failure",
+        content=task.supervisor_feedback,
+    )
     _broadcast_task_status(project, task)
     return StepResult(task=task, step=step_record, approved=False, feedback=task.supervisor_feedback, generated_diff=generated_diff)
 
@@ -589,17 +1154,174 @@ def _validate_step_with_supervisor(
     step: dict,
     generated_diff: str,
     run: OrchestrationRun,
+    step_record: OrchestrationStep | None = None,
+    task_record: TaskQueue | None = None,
 ) -> str:
+    expected_artifact_guidance = (
+        "If the instruction is primarily conversational/planning/diagnostic and does not require file edits, "
+        "do not reject solely because the diff is empty. Approve when the required non-code artifact is present and adequate."
+    )
     validation_prompt = (
         "Review the implementation diff for this step. If the diff completely satisfies the instruction, "
         "reply with APPROVED only. Otherwise explain what must be fixed.\n\n"
+        f"Validation guidance:\n{expected_artifact_guidance}\n\n"
         f"Step instruction:\n{step['instruction']}\n\n"
         f"Generated diff:\n{generated_diff}"
     )
     response = client.prompt(supervisor_session_id, project.absolute_path, validation_prompt, supervisor_agent)
-    capture_usage_event(run=run, session_id=supervisor_session_id, endpoint="session.message", payload=response)
+    _capture_usage_with_fallback(
+        client=client,
+        run=run,
+        session_id=supervisor_session_id,
+        directory=project.absolute_path,
+        endpoint="session.message",
+        payload=response,
+        step=step_record,
+        task=task_record,
+    )
     client.wait_for_idle(supervisor_session_id, project.absolute_path)
-    return extract_text_from_parts(response.get("parts", [])) or "Supervisor returned no feedback."
+    _store_session_messages_artifact(
+        client,
+        run=run,
+        step=step_record,
+        task=task_record,
+        session_id=supervisor_session_id,
+        directory=project.absolute_path,
+        label="supervisor-validation-messages",
+    )
+    feedback = extract_text_from_parts(response.get("parts", [])) or "Supervisor returned no feedback."
+    record_artifact(
+        run=run,
+        step=step_record,
+        task=task_record,
+        artifact_type=OrchestrationArtifact.ArtifactType.SUPERVISOR_FEEDBACK,
+        session_id=supervisor_session_id,
+        label="supervisor-validation-feedback",
+        content=feedback,
+    )
+    return feedback
+
+
+def _capture_usage_with_fallback(
+    *,
+    client: OpenCodeClient,
+    run: OrchestrationRun,
+    session_id: str,
+    directory: str,
+    endpoint: str,
+    payload: object,
+    step: OrchestrationStep | None,
+    task: TaskQueue | None,
+) -> None:
+    usage_event = capture_usage_event(run=run, session_id=session_id, endpoint=endpoint, payload=payload)
+    if usage_event is not None:
+        record_artifact(
+            run=run,
+            step=step,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.USAGE,
+            session_id=session_id,
+            label=f"usage:{endpoint}",
+            payload={
+                "prompt_tokens": usage_event.prompt_tokens,
+                "completion_tokens": usage_event.completion_tokens,
+                "total_tokens": usage_event.total_tokens,
+                "raw_usage": usage_event.raw_usage,
+            },
+        )
+        return
+
+    try:
+        client.wait_for_idle(session_id, directory)
+        messages_payload = client.session_messages(session_id, directory)
+    except Exception as error:  # noqa: BLE001
+        record_run_activity(
+            run=run,
+            step=step,
+            task=task,
+            kind="usage.capture_unavailable",
+            message=f"Unable to load session messages for usage fallback: {error}",
+            level=OrchestrationRunActivity.Level.WARNING,
+            session_id=session_id,
+            payload={"endpoint": endpoint},
+        )
+        return
+
+    usage_event = capture_usage_event(run=run, session_id=session_id, endpoint=f"{endpoint}.fallback_messages", payload=messages_payload)
+    if usage_event is not None:
+        record_artifact(
+            run=run,
+            step=step,
+            task=task,
+            artifact_type=OrchestrationArtifact.ArtifactType.USAGE,
+            session_id=session_id,
+            label=f"usage:{endpoint}:fallback",
+            payload={
+                "prompt_tokens": usage_event.prompt_tokens,
+                "completion_tokens": usage_event.completion_tokens,
+                "total_tokens": usage_event.total_tokens,
+                "raw_usage": usage_event.raw_usage,
+            },
+        )
+        return
+
+    record_run_activity(
+        run=run,
+        step=step,
+        task=task,
+        kind="usage.capture_unavailable",
+        message="No usage payload was found in prompt response or session message fallback.",
+        level=OrchestrationRunActivity.Level.WARNING,
+        session_id=session_id,
+        payload={"endpoint": endpoint},
+    )
+
+
+def _store_session_messages_artifact(
+    client: OpenCodeClient,
+    *,
+    run: OrchestrationRun,
+    session_id: str,
+    directory: str,
+    label: str,
+    step: OrchestrationStep | None = None,
+    task: TaskQueue | None = None,
+) -> None:
+    try:
+        messages_payload = client.session_messages(session_id, directory)
+    except Exception as error:  # noqa: BLE001
+        record_run_activity(
+            run=run,
+            step=step,
+            task=task,
+            kind="session.messages_unavailable",
+            message=f"Unable to persist session messages: {error}",
+            level=OrchestrationRunActivity.Level.WARNING,
+            session_id=session_id,
+        )
+        return
+
+    record_artifact(
+        run=run,
+        step=step,
+        task=task,
+        artifact_type=OrchestrationArtifact.ArtifactType.SESSION_MESSAGES,
+        session_id=session_id,
+        label=label,
+        payload={"items": messages_payload if isinstance(messages_payload, list) else [messages_payload]},
+    )
+
+
+def _evaluate_run_outcome(run: OrchestrationRun) -> str:
+    if run.total_steps <= 0:
+        return "Run finished without any executable steps."
+    if run.completed_steps <= 0:
+        return "Run failed because no orchestration steps completed successfully."
+    if run.failed_steps > 0:
+        return f"Run failed because {run.failed_steps} of {run.total_steps} steps failed verification or execution."
+    if run.completed_steps != run.total_steps:
+        return f"Run finished in an inconsistent state: completed {run.completed_steps} of {run.total_steps} steps."
+    return ""
 
 
 def _parse_supervisor_steps(supervisor_text: str) -> list[dict]:
@@ -648,13 +1370,23 @@ def _enqueue_run(run: OrchestrationRun):
 
 
 def mark_run_failed(run: OrchestrationRun, error_message: str) -> None:
-    run.status = OrchestrationRun.Status.FAILED
-    run.current_phase = "Failed"
-    run.last_error = error_message
-    run.finished_at = timezone.now()
-    run.progress_percent = min(run.progress_percent, 99)
-    run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "progress_percent", "updated_at"])
-    send_run_status_event(run.project, run)
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.FAILED,
+        current_phase="Failed",
+        last_error=error_message,
+        progress_percent=min(run.progress_percent, 99),
+        finished=True,
+        activity_kind="run.failed",
+        activity_message=error_message,
+        activity_level=OrchestrationRunActivity.Level.ERROR,
+    )
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.ERROR,
+        label="run-failure",
+        content=error_message,
+    )
     if run.user_id:
         create_user_notification(
             user=run.user,
@@ -692,28 +1424,5 @@ def _broadcast_task_status(project: Project, task: TaskQueue) -> None:
             "assigned_agent": task.assigned_agent,
             "status": task.status,
             "supervisor_feedback": task.supervisor_feedback,
-        },
-    )
-
-
-def send_run_status_event(project: Project, run: OrchestrationRun) -> None:
-    broadcast_project_event(
-        project.id,
-        {
-            "kind": "orchestration_run_updated",
-            "project_id": project.id,
-            "run_id": run.id,
-            "status": run.status,
-            "current_phase": run.current_phase,
-            "progress_percent": run.progress_percent,
-            "total_steps": run.total_steps,
-            "completed_steps": run.completed_steps,
-            "failed_steps": run.failed_steps,
-            "last_error": run.last_error,
-            "prompt_tokens": run.prompt_tokens,
-            "completion_tokens": run.completion_tokens,
-            "total_tokens": run.total_tokens,
-            "stuck_recovery_count": run.stuck_recovery_count,
-            "last_recovery_error": run.last_recovery_error,
         },
     )

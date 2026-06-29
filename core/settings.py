@@ -195,6 +195,8 @@ SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', 'false').lower()
 CSRF_COOKIE_SECURE = os.environ.get('CSRF_COOKIE_SECURE', 'false').lower() == 'true'
 
 MANAGED_PROJECTS_ROOT = os.environ.get('MANAGED_PROJECTS_ROOT', '')
+MANAGED_PROJECTS_HOST_ROOT = os.environ.get('MANAGED_PROJECTS_HOST_ROOT', '')
+MANAGED_PROJECTS_STORAGE_MODE = os.environ.get('MANAGED_PROJECTS_STORAGE_MODE', '')
 GLOBAL_TEMPLATE_PATH = os.environ.get('GLOBAL_TEMPLATE_PATH', '')
 OPENCODE_BINARY_PATH = os.environ.get('OPENCODE_BINARY_PATH', 'opencode')
 OPENCODE_WEB_SUBCOMMAND = os.environ.get('OPENCODE_WEB_SUBCOMMAND', 'serve')
@@ -218,6 +220,10 @@ GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '')
 GITHUB_API_BASE_URL = os.environ.get('GITHUB_API_BASE_URL', 'https://api.github.com')
 GITHUB_PR_BASE_BRANCH = os.environ.get('GITHUB_PR_BASE_BRANCH', 'dev')
 GITHUB_COMMIT_PREFIX = os.environ.get('GITHUB_COMMIT_PREFIX', 'chore(foundry):')
+GITHUB_REPO_PRIVATE = os.environ.get('GITHUB_REPO_PRIVATE', 'true').lower() == 'true'
+GITHUB_MERGE_METHOD = os.environ.get('GITHUB_MERGE_METHOD', 'squash')
+GITHUB_COMMITTER_NAME = os.environ.get('GITHUB_COMMITTER_NAME', 'Foundry AI')
+GITHUB_COMMITTER_EMAIL = os.environ.get('GITHUB_COMMITTER_EMAIL', 'foundry-ai@users.noreply.github.com')
 
 CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', REDIS_URL or 'redis://127.0.0.1:6379/0')
 CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', CELERY_BROKER_URL)

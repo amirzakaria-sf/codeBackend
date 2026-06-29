@@ -1,9 +1,13 @@
+from django.conf import settings
 from rest_framework import serializers
 
 from .models import (
     AuditLog,
     GitSyncJob,
+    OrchestrationArtifact,
+    OrchestrationPlanStep,
     OrchestrationRun,
+    OrchestrationRunActivity,
     OrchestrationStep,
     Project,
     TaskQueue,
@@ -11,6 +15,7 @@ from .models import (
     UserNotification,
     WorkspaceTarget,
 )
+from .services.provisioning import host_path_from_runtime_path
 
 
 class WorkspaceTargetSerializer(serializers.ModelSerializer):
@@ -34,15 +39,35 @@ class WorkspaceTargetSerializer(serializers.ModelSerializer):
 
 
 class ProjectSerializer(serializers.ModelSerializer):
+    owner_username = serializers.CharField(source="owner.username", read_only=True, default=None)
     locked_by_username = serializers.CharField(source="locked_by.username", read_only=True, default=None)
+    runtime_path = serializers.CharField(source="absolute_path", read_only=True)
+    host_path = serializers.SerializerMethodField()
+    storage_mode = serializers.SerializerMethodField()
     targets = WorkspaceTargetSerializer(many=True, read_only=True)
+
+    def get_host_path(self, obj: Project) -> str | None:
+        try:
+            return host_path_from_runtime_path(obj.absolute_path) or None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def get_storage_mode(self, obj: Project) -> str:
+        configured = (getattr(settings, "MANAGED_PROJECTS_STORAGE_MODE", "") or "").strip()
+        return configured or "unknown"
 
     class Meta:
         model = Project
         fields = (
             "id",
+            "owner",
+            "owner_username",
+            "path_owner_username",
             "name",
             "absolute_path",
+            "runtime_path",
+            "host_path",
+            "storage_mode",
             "workspace_mode",
             "starter_template",
             "setup_status",
@@ -58,11 +83,22 @@ class ProjectSerializer(serializers.ModelSerializer):
         )
         read_only_fields = (
             "id",
+            "owner",
+            "owner_username",
+            "path_owner_username",
+            "name",
             "absolute_path",
+            "runtime_path",
+            "host_path",
+            "storage_mode",
             "workspace_mode",
             "starter_template",
             "setup_status",
             "bootstrap_enabled",
+            "allocated_port",
+            "is_locked",
+            "locked_by",
+            "locked_by_username",
             "daemon_pid",
             "created_at",
             "updated_at",
@@ -169,6 +205,20 @@ class LockAcquireSerializer(serializers.Serializer):
     force = serializers.BooleanField(required=False, default=False)
 
 
+class PlanStepUpdateSerializer(serializers.Serializer):
+    assigned_agent = serializers.CharField(required=False, allow_blank=False, max_length=120)
+    instruction_payload = serializers.CharField(required=False, allow_blank=False)
+    sequence_order = serializers.IntegerField(required=False, min_value=1)
+
+
+class PlanApprovalSerializer(serializers.Serializer):
+    approved = serializers.BooleanField(required=False, default=True)
+
+
+class PlanReplanSerializer(serializers.Serializer):
+    feedback = serializers.CharField(required=False, allow_blank=True)
+
+
 class PendingApprovalTaskSerializer(serializers.ModelSerializer):
     project_name = serializers.CharField(source="project.name", read_only=True)
     requested_by = serializers.CharField(source="user.username", read_only=True, default="unknown")
@@ -183,6 +233,7 @@ class PendingApprovalTaskSerializer(serializers.ModelSerializer):
             "run",
             "instruction_payload",
             "sequence_order",
+            "approval_scope",
             "status",
             "created_at",
         )
@@ -200,6 +251,7 @@ class TaskQueueSerializer(serializers.ModelSerializer):
             "assigned_agent",
             "instruction_payload",
             "sequence_order",
+            "approval_scope",
             "status",
             "supervisor_feedback",
             "created_at",
@@ -229,9 +281,64 @@ class OrchestrationStepSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class OrchestrationPlanStepSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrchestrationPlanStep
+        fields = (
+            "id",
+            "run",
+            "sequence_order",
+            "assigned_agent",
+            "instruction_payload",
+            "status",
+            "planner_notes",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+
+class OrchestrationRunActivitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrchestrationRunActivity
+        fields = (
+            "id",
+            "run",
+            "step",
+            "task",
+            "kind",
+            "level",
+            "session_id",
+            "attempt_count",
+            "message",
+            "payload",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
+class OrchestrationArtifactSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = OrchestrationArtifact
+        fields = (
+            "id",
+            "run",
+            "step",
+            "task",
+            "artifact_type",
+            "session_id",
+            "label",
+            "content",
+            "payload",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
 class OrchestrationRunSerializer(serializers.ModelSerializer):
     user_username = serializers.CharField(source="user.username", read_only=True, default=None)
     steps = OrchestrationStepSerializer(many=True, read_only=True)
+    plan_steps = OrchestrationPlanStepSerializer(many=True, read_only=True)
 
     class Meta:
         model = OrchestrationRun
@@ -241,6 +348,9 @@ class OrchestrationRunSerializer(serializers.ModelSerializer):
             "user",
             "user_username",
             "prompt",
+            "approval_scope",
+            "complexity_level",
+            "plan_requires_approval",
             "status",
             "current_phase",
             "progress_percent",
@@ -259,10 +369,12 @@ class OrchestrationRunSerializer(serializers.ModelSerializer):
             "stuck_recovery_count",
             "last_recovery_at",
             "last_recovery_error",
+            "plan_approved_at",
             "started_at",
             "finished_at",
             "created_at",
             "updated_at",
+            "plan_steps",
             "steps",
         )
         read_only_fields = fields

@@ -20,7 +20,15 @@ class Project(models.Model):
         READY = "READY", "Ready"
         DRAFT = "DRAFT", "Draft / setup pending"
 
-    name = models.CharField(max_length=120, unique=True)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="owned_projects",
+    )
+    path_owner_username = models.CharField(max_length=120, blank=True, default="")
+    name = models.CharField(max_length=120)
     absolute_path = models.CharField(max_length=1024)
     workspace_mode = models.CharField(
         max_length=32,
@@ -54,6 +62,9 @@ class Project(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["path_owner_username", "name"], name="unique_project_name_per_path_owner"),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -113,11 +124,22 @@ class WorkspaceTarget(models.Model):
 
 
 class OrchestrationRun(models.Model):
+    class ApprovalScope(models.TextChoices):
+        NONE = "NONE", "No approval required"
+        LOCK = "LOCK", "Lock approval"
+        PLAN = "PLAN", "Plan approval"
+
+    class ComplexityLevel(models.TextChoices):
+        SIMPLE = "SIMPLE", "Simple"
+        COMPLEX = "COMPLEX", "Complex"
+
     class Status(models.TextChoices):
         PENDING_APPROVAL = "PENDING_APPROVAL", "Pending approval"
         QUEUED = "QUEUED", "Queued"
         PLANNING = "PLANNING", "Planning"
         BREAKING_DOWN = "BREAKING_DOWN", "Breaking down"
+        PLAN_READY = "PLAN_READY", "Plan ready"
+        AWAITING_PLAN_APPROVAL = "AWAITING_PLAN_APPROVAL", "Awaiting plan approval"
         RUNNING = "RUNNING", "Running"
         VERIFYING = "VERIFYING", "Verifying"
         COMPLETED = "COMPLETED", "Completed"
@@ -137,6 +159,17 @@ class OrchestrationRun(models.Model):
         related_name="orchestration_runs",
     )
     prompt = models.TextField()
+    approval_scope = models.CharField(
+        max_length=16,
+        choices=ApprovalScope.choices,
+        default=ApprovalScope.NONE,
+    )
+    complexity_level = models.CharField(
+        max_length=16,
+        choices=ComplexityLevel.choices,
+        default=ComplexityLevel.SIMPLE,
+    )
+    plan_requires_approval = models.BooleanField(default=False)
     status = models.CharField(
         max_length=32,
         choices=Status.choices,
@@ -159,6 +192,7 @@ class OrchestrationRun(models.Model):
     stuck_recovery_count = models.PositiveIntegerField(default=0)
     last_recovery_at = models.DateTimeField(null=True, blank=True)
     last_recovery_error = models.TextField(blank=True, default="")
+    plan_approved_at = models.DateTimeField(null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -172,6 +206,11 @@ class OrchestrationRun(models.Model):
 
 
 class TaskQueue(models.Model):
+    class ApprovalScope(models.TextChoices):
+        NONE = "NONE", "No approval required"
+        LOCK = "LOCK", "Lock approval"
+        PLAN = "PLAN", "Plan approval"
+
     class Status(models.TextChoices):
         PENDING_APPROVAL = "PENDING_APPROVAL", "Pending approval"
         QUEUED = "QUEUED", "Queued"
@@ -202,6 +241,11 @@ class TaskQueue(models.Model):
     assigned_agent = models.CharField(max_length=120)
     instruction_payload = models.TextField()
     sequence_order = models.PositiveIntegerField(default=1)
+    approval_scope = models.CharField(
+        max_length=16,
+        choices=ApprovalScope.choices,
+        default=ApprovalScope.NONE,
+    )
     status = models.CharField(
         max_length=32,
         choices=Status.choices,
@@ -251,6 +295,120 @@ class OrchestrationStep(models.Model):
 
     def __str__(self) -> str:
         return f"Run {self.run_id} :: Step {self.sequence_order} :: {self.status}"
+
+
+class OrchestrationPlanStep(models.Model):
+    class Status(models.TextChoices):
+        DRAFT = "DRAFT", "Draft"
+        APPROVED = "APPROVED", "Approved"
+        REPLACED = "REPLACED", "Replaced"
+
+    run = models.ForeignKey(
+        OrchestrationRun,
+        on_delete=models.CASCADE,
+        related_name="plan_steps",
+    )
+    sequence_order = models.PositiveIntegerField(default=1)
+    assigned_agent = models.CharField(max_length=120)
+    instruction_payload = models.TextField()
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    planner_notes = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sequence_order", "created_at"]
+
+    def __str__(self) -> str:
+        return f"Run {self.run_id} :: Plan step {self.sequence_order} :: {self.status}"
+
+
+class OrchestrationRunActivity(models.Model):
+    class Level(models.TextChoices):
+        INFO = "INFO", "Info"
+        WARNING = "WARNING", "Warning"
+        ERROR = "ERROR", "Error"
+
+    run = models.ForeignKey(
+        OrchestrationRun,
+        on_delete=models.CASCADE,
+        related_name="activities",
+    )
+    step = models.ForeignKey(
+        OrchestrationStep,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="activities",
+    )
+    task = models.ForeignKey(
+        TaskQueue,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="activities",
+    )
+    kind = models.CharField(max_length=64)
+    level = models.CharField(max_length=16, choices=Level.choices, default=Level.INFO)
+    session_id = models.CharField(max_length=255, blank=True, default="")
+    attempt_count = models.PositiveIntegerField(default=0)
+    message = models.TextField(blank=True, default="")
+    payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self) -> str:
+        return f"Run {self.run_id} :: {self.kind} :: {self.level}"
+
+
+class OrchestrationArtifact(models.Model):
+    class ArtifactType(models.TextChoices):
+        PLAN = "PLAN", "Plan"
+        STEP_LIST = "STEP_LIST", "Step list"
+        MESSAGE = "MESSAGE", "Message"
+        DIFF = "DIFF", "Diff"
+        SUPERVISOR_FEEDBACK = "SUPERVISOR_FEEDBACK", "Supervisor feedback"
+        SESSION_MESSAGES = "SESSION_MESSAGES", "Session messages"
+        SESSION_DIFF = "SESSION_DIFF", "Session diff"
+        SESSION_STATUS = "SESSION_STATUS", "Session status"
+        SHELL_OUTPUT = "SHELL_OUTPUT", "Shell output"
+        USAGE = "USAGE", "Usage"
+        ERROR = "ERROR", "Error"
+        APPROVAL = "APPROVAL", "Approval"
+
+    run = models.ForeignKey(
+        OrchestrationRun,
+        on_delete=models.CASCADE,
+        related_name="artifacts",
+    )
+    step = models.ForeignKey(
+        OrchestrationStep,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="artifacts",
+    )
+    task = models.ForeignKey(
+        TaskQueue,
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="artifacts",
+    )
+    artifact_type = models.CharField(max_length=32, choices=ArtifactType.choices)
+    session_id = models.CharField(max_length=255, blank=True, default="")
+    label = models.CharField(max_length=255, blank=True, default="")
+    content = models.TextField(blank=True, default="")
+    payload = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self) -> str:
+        return f"Run {self.run_id} :: {self.artifact_type}"
 
 
 class AuditLog(models.Model):
