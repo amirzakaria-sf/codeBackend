@@ -15,7 +15,7 @@ class DaemonStartError(Exception):
     """Raised when OpenCode daemon startup fails."""
 
 
-def _venv_bin_path(project_root: Path) -> Path:
+def _venv_bin_path(project_root: Path) -> Path | None:
     backend_venv = project_root / "backend" / "venv"
     unix_bin = backend_venv / "bin"
     windows_bin = backend_venv / "Scripts"
@@ -25,9 +25,7 @@ def _venv_bin_path(project_root: Path) -> Path:
     if windows_bin.exists():
         return windows_bin
 
-    raise DaemonStartError(
-        f"Backend venv bin directory does not exist for project at: {project_root}"
-    )
+    return None
 
 
 def project_root_from_name(project_name: str) -> Path:
@@ -61,8 +59,9 @@ def start_opencode_daemon(project_name: str, allocated_port: int) -> subprocess.
 
     env = os.environ.copy()
     original_path = env.get("PATH", "")
-    env["PATH"] = f"{venv_bin_path}{os.pathsep}{original_path}" if original_path else str(venv_bin_path)
-    env["VIRTUAL_ENV"] = str(backend_venv)
+    if venv_bin_path:
+        env["PATH"] = f"{venv_bin_path}{os.pathsep}{original_path}" if original_path else str(venv_bin_path)
+        env["VIRTUAL_ENV"] = str(backend_venv)
 
     opencode_binary = settings.OPENCODE_BINARY_PATH
     opencode_subcommand = settings.OPENCODE_WEB_SUBCOMMAND

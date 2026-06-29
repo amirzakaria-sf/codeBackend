@@ -113,6 +113,49 @@ class ProjectViewSet(viewsets.ModelViewSet):
             raise OrchestrationError("Project does not have an allocated OpenCode port.")
         return OpenCodeClient(project.allocated_port)
 
+    def _ensure_runtime_ready(self, project: Project, user) -> Project:
+        if project.is_locked and project.locked_by_id and project.locked_by_id != user.id and not (user.is_staff or user.is_superuser):
+            raise PermissionDenied("Workspace is locked by another user.")
+
+        fields_to_update: list[str] = []
+        if not project.is_locked or project.locked_by_id != user.id:
+            project.is_locked = True
+            project.locked_by = user
+            fields_to_update.extend(["is_locked", "locked_by", "updated_at"])
+
+        if not project.allocated_port:
+            project.allocated_port = allocate_available_port()
+            fields_to_update.extend(["allocated_port", "updated_at"])
+
+        port = int(project.allocated_port)
+        daemon_running = is_daemon_running(project.daemon_pid)
+        health = daemon_health(port) if daemon_running else {"reachable": False, "healthy": False}
+
+        if not daemon_running or not health.get("reachable") or not health.get("healthy"):
+            if project.daemon_pid:
+                stop_opencode_daemon(project.daemon_pid)
+            process = start_opencode_daemon(project.name, port)
+            project.daemon_pid = process.pid
+            fields_to_update.extend(["daemon_pid", "updated_at"])
+
+        if fields_to_update:
+            unique_fields = []
+            for field in fields_to_update:
+                if field not in unique_fields:
+                    unique_fields.append(field)
+            project.save(update_fields=unique_fields)
+            broadcast_project_event(
+                project.id,
+                {
+                    "kind": "lock_status_changed",
+                    "project_id": project.id,
+                    "is_locked": project.is_locked,
+                    "locked_by": project.locked_by.username if project.locked_by else None,
+                },
+            )
+
+        return project
+
     @staticmethod
     def _sanitize_reference_filename(filename: str) -> str:
         base_name = Path(filename).name
@@ -409,6 +452,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
 
         try:
+            project = self._ensure_runtime_ready(project, request.user)
             result = execute_or_queue_project_prompt(
                 project=project,
                 user=request.user,
@@ -423,6 +467,24 @@ class ProjectViewSet(viewsets.ModelViewSet):
             )
 
         return Response(result, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"], url_path="prepare-workspace", throttle_classes=[ProjectMutationThrottle])
+    def prepare_workspace(self, request, pk=None):
+        project = get_object_or_404(Project, pk=pk)
+        try:
+            prepared = self._ensure_runtime_ready(project, request.user)
+        except (ProvisioningError, DaemonStartError, PermissionDenied) as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as error:  # noqa: BLE001
+            return Response({"detail": f"Unable to prepare workspace runtime: {error}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response(
+            {
+                "detail": "Workspace runtime is ready.",
+                "project": ProjectSerializer(prepared).data,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(
         detail=True,

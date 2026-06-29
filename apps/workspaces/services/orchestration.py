@@ -9,6 +9,7 @@ from django.utils import timezone
 from opencode_client import OpenCodeClient, diff_to_text, extract_text_from_parts
 
 from ..models import AuditLog, OrchestrationRun, OrchestrationStep, Project, TaskQueue
+from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
 from .github_sync import enqueue_github_sync_for_run
 from .notifications import create_user_notification
 from .realtime import broadcast_project_event, broadcast_user_event
@@ -132,16 +133,6 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
     run.celery_task_id = task_result.id
     run.save(update_fields=["celery_task_id", "updated_at"])
     send_run_status_event(project, run)
-    if task.user_id:
-        create_user_notification(
-            user=task.user,
-            kind="approval_approved",
-            title=f"Task approved on {project.name}",
-            message=f"{approver.username} approved your queued task.",
-            project=project,
-            run=run,
-            payload={"task_id": task.id, "run_id": run.id},
-        )
     return {
         "mode": "queued",
         "run_id": run.id,
@@ -280,6 +271,15 @@ def perform_orchestration_run(run_id: int) -> dict:
     if not run.project.allocated_port:
         mark_run_failed(run, "Project does not have an allocated OpenCode port.")
         raise OrchestrationError("Project does not have an allocated OpenCode port.")
+
+    daemon_running = is_daemon_running(run.project.daemon_pid)
+    health = daemon_health(run.project.allocated_port) if daemon_running else {"reachable": False, "healthy": False}
+    if not daemon_running or not health.get("reachable") or not health.get("healthy"):
+        if run.project.daemon_pid:
+            stop_opencode_daemon(run.project.daemon_pid)
+        process = start_opencode_daemon(run.project.name, int(run.project.allocated_port))
+        run.project.daemon_pid = process.pid
+        run.project.save(update_fields=["daemon_pid", "updated_at"])
 
     if not run.user_id:
         mark_run_failed(run, "Run has no associated requesting user.")
