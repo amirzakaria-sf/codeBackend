@@ -428,7 +428,11 @@ def perform_orchestration_run(run_id: int) -> dict:
     health = daemon_health(run.project.allocated_port) if daemon_running else {"reachable": False, "healthy": False}
     if not daemon_running or not health.get("reachable") or not health.get("healthy"):
         if run.project.daemon_pid:
-            stop_opencode_daemon(run.project.daemon_pid)
+            stop_opencode_daemon(
+                run.project.daemon_pid,
+                allocated_port=run.project.allocated_port,
+                project_absolute_path=run.project.absolute_path,
+            )
         process = start_opencode_daemon(run.project.absolute_path, int(run.project.allocated_port))
         run.project.daemon_pid = process.pid
         run.project.save(update_fields=["daemon_pid", "updated_at"])

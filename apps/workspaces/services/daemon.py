@@ -4,6 +4,7 @@ import signal
 import socket
 import subprocess
 import time
+from hashlib import sha1
 from pathlib import Path
 
 import httpx
@@ -65,11 +66,14 @@ def _docker_command(project_root: Path, allocated_port: int, opencode_binary: st
         raise DaemonStartError("OPENCODE_DAEMON_DOCKER_IMAGE must be configured when OPENCODE_DAEMON_SANDBOX_MODE=docker.")
 
     container_workdir = (getattr(settings, "OPENCODE_DAEMON_CONTAINER_WORKDIR", "/workspace") or "/workspace").strip() or "/workspace"
+    container_name = _docker_container_name(project_root, allocated_port)
     return [
         "docker",
         "run",
         "--rm",
         "--init",
+        "--name",
+        container_name,
         "-v",
         f"{project_root}:{container_workdir}",
         "-w",
@@ -84,6 +88,11 @@ def _docker_command(project_root: Path, allocated_port: int, opencode_binary: st
         "--hostname",
         "0.0.0.0",
     ]
+
+
+def _docker_container_name(project_root: Path, allocated_port: int) -> str:
+    digest = sha1(f"{project_root}:{allocated_port}".encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return f"opencode-daemon-{digest}"
 
 
 def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> subprocess.Popen:
@@ -152,7 +161,7 @@ def is_daemon_running(pid: int | None) -> bool:
     return True
 
 
-def stop_opencode_daemon(pid: int, timeout_seconds: float = 8.0) -> bool:
+def _kill_pid(pid: int, timeout_seconds: float) -> bool:
     if not is_daemon_running(pid):
         return True
 
@@ -173,6 +182,87 @@ def stop_opencode_daemon(pid: int, timeout_seconds: float = 8.0) -> bool:
         return True
 
     return not is_daemon_running(pid)
+
+
+def _pids_listening_on_port(port: int) -> set[int]:
+    try:
+        output = subprocess.check_output(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except Exception:  # noqa: BLE001
+        return set()
+
+    pids: set[int] = set()
+    for raw in output.splitlines():
+        value = raw.strip()
+        if not value:
+            continue
+        try:
+            pids.add(int(value))
+        except ValueError:
+            continue
+    return pids
+
+
+def _is_port_reachable(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def _stop_port_bound_processes(port: int, timeout_seconds: float) -> bool:
+    listener_pids = _pids_listening_on_port(port)
+    if not listener_pids:
+        return not _is_port_reachable(port)
+
+    all_stopped = True
+    for listener_pid in listener_pids:
+        if not _kill_pid(listener_pid, timeout_seconds=timeout_seconds):
+            all_stopped = False
+    return all_stopped and not _is_port_reachable(port)
+
+
+def _stop_docker_container(project_absolute_path: str, allocated_port: int) -> bool:
+    sandbox_mode = (getattr(settings, "OPENCODE_DAEMON_SANDBOX_MODE", "host") or "host").strip().lower()
+    if sandbox_mode != "docker":
+        return True
+
+    try:
+        project_root = project_root_from_path(project_absolute_path)
+    except Exception:  # noqa: BLE001
+        return False
+
+    container_name = _docker_container_name(project_root, allocated_port)
+    result = subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def stop_opencode_daemon(
+    pid: int | None,
+    timeout_seconds: float = 8.0,
+    allocated_port: int | None = None,
+    project_absolute_path: str | None = None,
+) -> bool:
+    stopped_by_pid = True
+    if pid:
+        stopped_by_pid = _kill_pid(pid, timeout_seconds=timeout_seconds)
+
+    stopped_by_port = True
+    if allocated_port:
+        stopped_by_port = _stop_port_bound_processes(allocated_port, timeout_seconds=timeout_seconds)
+
+    stopped_docker = True
+    if allocated_port and project_absolute_path:
+        stopped_docker = _stop_docker_container(project_absolute_path, allocated_port)
+
+    return stopped_by_pid and stopped_by_port and stopped_docker
 
 
 def daemon_health(port: int | None) -> dict:

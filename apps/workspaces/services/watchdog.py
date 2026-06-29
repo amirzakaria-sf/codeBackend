@@ -88,7 +88,11 @@ def _heal_projects() -> None:
         )
 
         if project.daemon_pid:
-            stop_opencode_daemon(project.daemon_pid)
+            stop_opencode_daemon(
+                project.daemon_pid,
+                allocated_port=project.allocated_port,
+                project_absolute_path=project.absolute_path,
+            )
 
         process = start_opencode_daemon(project.absolute_path, project.allocated_port)
         old_pid = project.daemon_pid

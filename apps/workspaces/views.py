@@ -2,6 +2,7 @@ import re
 import uuid
 from pathlib import Path
 
+from celery.result import AsyncResult
 from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
@@ -102,6 +103,17 @@ ALLOWED_REFERENCE_EXTENSIONS = {
 }
 MAX_REFERENCE_UPLOAD_BYTES = 25 * 1024 * 1024
 
+ACTIVE_RUN_STATUSES = {
+    OrchestrationRun.Status.PENDING_APPROVAL,
+    OrchestrationRun.Status.QUEUED,
+    OrchestrationRun.Status.PLANNING,
+    OrchestrationRun.Status.BREAKING_DOWN,
+    OrchestrationRun.Status.PLAN_READY,
+    OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
+    OrchestrationRun.Status.RUNNING,
+    OrchestrationRun.Status.VERIFYING,
+}
+
 
 class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
     queryset = Project.objects.all().select_related("locked_by", "owner").prefetch_related("targets")
@@ -164,7 +176,11 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
 
         if not daemon_running or not health.get("reachable") or not health.get("healthy"):
             if project.daemon_pid:
-                stop_opencode_daemon(project.daemon_pid)
+                stop_opencode_daemon(
+                    project.daemon_pid,
+                    allocated_port=project.allocated_port,
+                    project_absolute_path=project.absolute_path,
+                )
             process = start_opencode_daemon(project.absolute_path, port)
             project.daemon_pid = process.pid
             fields_to_update.extend(["daemon_pid", "updated_at"])
@@ -412,10 +428,34 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
     def stop_daemon(self, request, pk=None):
         project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
-        if not project.daemon_pid:
-            return Response({"detail": "No daemon PID recorded for this project."}, status=status.HTTP_400_BAD_REQUEST)
+        if not project.daemon_pid and not project.allocated_port:
+            return Response({"detail": "No daemon PID or allocated port recorded for this project."}, status=status.HTTP_400_BAD_REQUEST)
 
-        stopped = stop_opencode_daemon(project.daemon_pid)
+        active_runs = list(project.runs.filter(status__in=ACTIVE_RUN_STATUSES).order_by("-created_at"))
+        if active_runs:
+            for run in active_runs:
+                task_id = (run.celery_task_id or "").strip()
+                if task_id:
+                    try:
+                        AsyncResult(task_id).revoke(terminate=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                run.status = OrchestrationRun.Status.CANCELLED
+                run.current_phase = "Cancelled after daemon stop"
+                run.last_error = "Run cancelled manually when daemon was stopped."
+                run.finished_at = timezone.now()
+                run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
+
+            TaskQueue.objects.filter(run__in=active_runs, status__in=[TaskQueue.Status.QUEUED, TaskQueue.Status.RUNNING, TaskQueue.Status.VERIFYING]).update(
+                status=TaskQueue.Status.FAILED,
+                supervisor_feedback="Task cancelled because daemon was manually stopped.",
+            )
+
+        stopped = stop_opencode_daemon(
+            project.daemon_pid,
+            allocated_port=project.allocated_port,
+            project_absolute_path=project.absolute_path,
+        )
         if not stopped:
             return Response({"detail": "Failed to stop daemon process."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -437,8 +477,12 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         serializer = StartDaemonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        if project.daemon_pid:
-            stop_opencode_daemon(project.daemon_pid)
+        if project.daemon_pid or project.allocated_port:
+            stop_opencode_daemon(
+                project.daemon_pid,
+                allocated_port=project.allocated_port,
+                project_absolute_path=project.absolute_path,
+            )
 
         allocated_port = serializer.validated_data.get("allocated_port") or project.allocated_port or allocate_available_port()
         process = start_opencode_daemon(project.absolute_path, allocated_port)
