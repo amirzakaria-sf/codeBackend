@@ -1,8 +1,13 @@
+import re
+import uuid
+from pathlib import Path
+
 from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from opencode_client import OpenCodeClient, OpenCodeClientError
@@ -53,6 +58,43 @@ from .services.realtime import broadcast_project_event
 from .throttles import ExecutePromptThrottle, ProjectMutationThrottle
 
 
+ALLOWED_REFERENCE_EXTENSIONS = {
+    ".pdf",
+    ".md",
+    ".txt",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".html",
+    ".css",
+    ".scss",
+    ".java",
+    ".go",
+    ".rs",
+    ".c",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".sh",
+    ".sql",
+    ".xml",
+    ".toml",
+    ".ini",
+}
+MAX_REFERENCE_UPLOAD_BYTES = 25 * 1024 * 1024
+
+
 class ProjectViewSet(viewsets.ModelViewSet):
     queryset = Project.objects.all().select_related("locked_by").prefetch_related("targets")
     serializer_class = ProjectSerializer
@@ -70,6 +112,23 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if not project.allocated_port:
             raise OrchestrationError("Project does not have an allocated OpenCode port.")
         return OpenCodeClient(project.allocated_port)
+
+    @staticmethod
+    def _sanitize_reference_filename(filename: str) -> str:
+        base_name = Path(filename).name
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", base_name).strip("-._")
+        return cleaned or "reference-upload"
+
+    @staticmethod
+    def _doc_references_root(project: Project) -> Path:
+        project_root = Path(project.absolute_path).expanduser().resolve()
+        if not project_root.exists() or not project_root.is_dir():
+            raise ProvisioningError("Project workspace path does not exist on disk.")
+        references_root = (project_root / "doc-references").resolve()
+        if project_root not in references_root.parents:
+            raise ProvisioningError("Invalid doc-references path.")
+        references_root.mkdir(parents=True, exist_ok=True)
+        return references_root
 
     @action(detail=True, methods=["post"], url_path="lock-acquire", throttle_classes=[ProjectMutationThrottle])
     def lock_acquire(self, request, pk=None):
@@ -364,6 +423,62 @@ class ProjectViewSet(viewsets.ModelViewSet):
             )
 
         return Response(result, status=status.HTTP_200_OK)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="references/upload",
+        throttle_classes=[ProjectMutationThrottle],
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def upload_reference(self, request, pk=None):
+        project = get_object_or_404(Project, pk=pk)
+        self._require_lock_owner_or_admin(request.user, project)
+        upload = request.FILES.get("file")
+        if upload is None:
+            return Response({"detail": "Missing file in request payload."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if upload.size > MAX_REFERENCE_UPLOAD_BYTES:
+            return Response(
+                {"detail": f"File exceeds maximum upload size of {MAX_REFERENCE_UPLOAD_BYTES // (1024 * 1024)} MB."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        safe_filename = self._sanitize_reference_filename(getattr(upload, "name", "reference-upload"))
+        extension = Path(safe_filename).suffix.lower()
+        if extension not in ALLOWED_REFERENCE_EXTENSIONS:
+            return Response(
+                {"detail": f"Unsupported file type '{extension or 'unknown'}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            references_root = self._doc_references_root(project)
+        except ProvisioningError as error:
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+
+        timestamp = timezone.now().strftime("%Y%m%d-%H%M%S")
+        destination_name = f"{timestamp}-{uuid.uuid4().hex[:8]}-{safe_filename}"
+        destination = (references_root / destination_name).resolve()
+        project_root = Path(project.absolute_path).expanduser().resolve()
+        if project_root not in destination.parents:
+            return Response({"detail": "Resolved upload path escapes project root."}, status=status.HTTP_400_BAD_REQUEST)
+
+        with destination.open("wb") as destination_file:
+            for chunk in upload.chunks():
+                destination_file.write(chunk)
+
+        relative_path = destination.relative_to(project_root).as_posix()
+        return Response(
+            {
+                "filename": destination_name,
+                "relative_path": relative_path,
+                "absolute_path": str(destination),
+                "size_bytes": upload.size,
+                "content_type": getattr(upload, "content_type", "application/octet-stream"),
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=["get"], url_path="runs")
     def runs(self, request, pk=None):
