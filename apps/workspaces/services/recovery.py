@@ -10,7 +10,7 @@ from django.utils import timezone
 from opencode_client import OpenCodeClient, OpenCodeClientError
 
 from ..models import OrchestrationRun, Project, TaskQueue
-from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
+from .daemon import daemon_directory_for_project, daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
 from .orchestration import mark_run_failed
 from .realtime import broadcast_project_event
 from .telemetry import record_run_activity, send_run_status_event
@@ -81,6 +81,10 @@ def recover_stuck_run(run_id: int) -> dict:
         return {"mode": "missing", "run_id": run_id}
     if run.status in {OrchestrationRun.Status.COMPLETED, OrchestrationRun.Status.FAILED, OrchestrationRun.Status.CANCELLED}:
         return {"mode": "finished", "run_id": run.id, "status": run.status}
+    if run.project.daemon_desired_state == Project.DaemonDesiredState.STOPPED:
+        mark_run_failed(run, "Automated recovery skipped because daemon desired state is STOPPED.")
+        _unlock_project(run.project)
+        return {"mode": "failed", "run_id": run.id, "reason": "daemon_stopped"}
 
     max_attempts = max(1, settings.STUCK_RUN_MAX_RECOVERY_ATTEMPTS)
     if run.stuck_recovery_count >= max_attempts:
@@ -146,7 +150,7 @@ def _attempt_interrupt(run: OrchestrationRun) -> None:
     if not session_id:
         raise OpenCodeClientError("No active session available for interrupt recovery.")
     client = OpenCodeClient(run.project.allocated_port)
-    client.abort_session(session_id, run.project.absolute_path)
+    client.abort_session(session_id, daemon_directory_for_project(run.project.absolute_path))
 
 
 def _attempt_continue(run: OrchestrationRun) -> None:
@@ -156,7 +160,7 @@ def _attempt_continue(run: OrchestrationRun) -> None:
 
     client = OpenCodeClient(run.project.allocated_port)
     agent = _resolve_recovery_agent(run)
-    client.prompt(session_id, run.project.absolute_path, "continue", agent)
+    client.prompt(session_id, daemon_directory_for_project(run.project.absolute_path), "continue", agent)
 
 
 def _attempt_daemon_restart(run: OrchestrationRun) -> None:
@@ -174,7 +178,10 @@ def _attempt_daemon_restart(run: OrchestrationRun) -> None:
     process = start_opencode_daemon(project.absolute_path, project.allocated_port)
     old_pid = project.daemon_pid
     project.daemon_pid = process.pid
-    project.save(update_fields=["daemon_pid", "updated_at"])
+    project.daemon_desired_state = Project.DaemonDesiredState.RUNNING
+    project.daemon_stop_requested_at = None
+    project.daemon_last_heartbeat_at = timezone.now()
+    project.save(update_fields=["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
 
     broadcast_project_event(
         project.id,

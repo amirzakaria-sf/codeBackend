@@ -36,13 +36,14 @@ class ProjectAdmin(admin.ModelAdmin):
         "starter_template",
         "setup_status",
         "allocated_port",
+        "daemon_desired_state",
         "is_locked",
         "locked_by",
         "daemon_pid",
         "created_at",
     )
     search_fields = ("name", "absolute_path")
-    list_filter = ("workspace_mode", "setup_status", "is_locked", "created_at")
+    list_filter = ("workspace_mode", "setup_status", "daemon_desired_state", "is_locked", "created_at")
     inlines = (WorkspaceTargetInline,)
 
 

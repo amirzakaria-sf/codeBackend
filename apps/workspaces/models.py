@@ -3,6 +3,10 @@ from django.db import models
 
 
 class Project(models.Model):
+    class DaemonDesiredState(models.TextChoices):
+        RUNNING = "RUNNING", "Running"
+        STOPPED = "STOPPED", "Stopped"
+
     class WorkspaceMode(models.TextChoices):
         STARTER = "STARTER", "Starter workspace"
         ACTIVE_CLONE = "ACTIVE_CLONE", "Active clone"
@@ -48,6 +52,13 @@ class Project(models.Model):
     )
     bootstrap_enabled = models.BooleanField(default=False)
     allocated_port = models.IntegerField(null=True, blank=True)
+    daemon_desired_state = models.CharField(
+        max_length=16,
+        choices=DaemonDesiredState.choices,
+        default=DaemonDesiredState.STOPPED,
+    )
+    daemon_last_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    daemon_stop_requested_at = models.DateTimeField(null=True, blank=True)
     is_locked = models.BooleanField(default=False)
     locked_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

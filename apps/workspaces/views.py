@@ -42,8 +42,9 @@ from .serializers import (
 from .services.daemon import (
     DaemonStartError,
     allocate_available_port,
-    daemon_health,
-    is_daemon_running,
+    daemon_directory_for_project,
+    daemon_runtime_status,
+    project_opencode_config_summary,
     start_opencode_daemon,
     stop_opencode_daemon,
 )
@@ -64,6 +65,7 @@ from .services.provisioning import (
     provision_project_structure,
 )
 from .services.realtime import broadcast_project_event
+from .services.telemetry import send_run_status_event
 from .throttles import ExecutePromptThrottle, ProjectMutationThrottle
 
 
@@ -156,6 +158,94 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             raise OrchestrationError("Project does not have an allocated OpenCode port.")
         return OpenCodeClient(project.allocated_port)
 
+    @staticmethod
+    def _daemon_directory(project: Project) -> str:
+        return daemon_directory_for_project(project.absolute_path)
+
+    @staticmethod
+    def _dedupe_update_fields(fields: list[str]) -> list[str]:
+        unique_fields: list[str] = []
+        for field in fields:
+            if field not in unique_fields:
+                unique_fields.append(field)
+        return unique_fields
+
+    @staticmethod
+    def _mark_daemon_running_intent(project: Project, *, allocated_port: int | None = None, daemon_pid: int | None = None) -> None:
+        project.daemon_desired_state = Project.DaemonDesiredState.RUNNING
+        project.daemon_stop_requested_at = None
+        project.daemon_last_heartbeat_at = timezone.now()
+        if allocated_port is not None:
+            project.allocated_port = allocated_port
+        if daemon_pid is not None:
+            project.daemon_pid = daemon_pid
+
+    @staticmethod
+    def _mark_daemon_stopped_intent(project: Project) -> None:
+        project.daemon_desired_state = Project.DaemonDesiredState.STOPPED
+        project.daemon_stop_requested_at = timezone.now()
+
+    @staticmethod
+    def _refresh_daemon_heartbeat(project: Project, runtime_status: dict) -> bool:
+        if runtime_status.get("reachable") or runtime_status.get("healthy"):
+            project.daemon_last_heartbeat_at = timezone.now()
+            return True
+        return False
+
+    @staticmethod
+    def _daemon_config_diagnostics(project: Project) -> dict:
+        try:
+            summary = project_opencode_config_summary(project.absolute_path)
+            return {
+                "loaded": True,
+                **summary,
+            }
+        except DaemonStartError as error:
+            return {
+                "loaded": False,
+                "error": str(error),
+            }
+
+    @staticmethod
+    def _cancel_active_runs_after_daemon_stop(project: Project) -> None:
+        active_runs = list(project.runs.filter(status__in=ACTIVE_RUN_STATUSES).order_by("-created_at"))
+        if not active_runs:
+            return
+
+        finished_at = timezone.now()
+        for run in active_runs:
+            task_id = (run.celery_task_id or "").strip()
+            if task_id:
+                try:
+                    AsyncResult(task_id).revoke(terminate=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            run.status = OrchestrationRun.Status.CANCELLED
+            run.current_phase = "Cancelled after daemon stop"
+            run.last_error = "Run cancelled manually when daemon was stopped."
+            run.finished_at = finished_at
+            run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
+            send_run_status_event(project.id, run)
+
+        TaskQueue.objects.filter(run__in=active_runs, status__in=[TaskQueue.Status.QUEUED, TaskQueue.Status.RUNNING, TaskQueue.Status.VERIFYING]).update(
+            status=TaskQueue.Status.FAILED,
+            supervisor_feedback="Task cancelled because daemon was manually stopped.",
+        )
+
+        if project.is_locked:
+            project.is_locked = False
+            project.locked_by = None
+            project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+            broadcast_project_event(
+                project.id,
+                {
+                    "kind": "lock_status_changed",
+                    "project_id": project.id,
+                    "is_locked": False,
+                    "locked_by": None,
+                },
+            )
+
     def _ensure_runtime_ready(self, project: Project, user) -> Project:
         if project.is_locked and project.locked_by_id and project.locked_by_id != user.id and not (user.is_staff or user.is_superuser):
             raise PermissionDenied("Workspace is locked by another user.")
@@ -170,11 +260,18 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             project.allocated_port = allocate_available_port()
             fields_to_update.extend(["allocated_port", "updated_at"])
 
-        port = int(project.allocated_port)
-        daemon_running = is_daemon_running(project.daemon_pid)
-        health = daemon_health(port) if daemon_running else {"reachable": False, "healthy": False}
+        if project.daemon_desired_state != Project.DaemonDesiredState.RUNNING:
+            self._mark_daemon_running_intent(project)
+            fields_to_update.extend(["daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
 
-        if not daemon_running or not health.get("reachable") or not health.get("healthy"):
+        port = int(project.allocated_port)
+        runtime_status = daemon_runtime_status(project.daemon_pid, port)
+
+        if runtime_status.get("reachable") or runtime_status.get("healthy"):
+            if self._refresh_daemon_heartbeat(project, runtime_status):
+                fields_to_update.extend(["daemon_last_heartbeat_at", "updated_at"])
+
+        if not runtime_status.get("running") or not runtime_status.get("reachable") or not runtime_status.get("healthy"):
             if project.daemon_pid:
                 stop_opencode_daemon(
                     project.daemon_pid,
@@ -182,15 +279,11 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                     project_absolute_path=project.absolute_path,
                 )
             process = start_opencode_daemon(project.absolute_path, port)
-            project.daemon_pid = process.pid
-            fields_to_update.extend(["daemon_pid", "updated_at"])
+            self._mark_daemon_running_intent(project, daemon_pid=process.pid)
+            fields_to_update.extend(["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
 
         if fields_to_update:
-            unique_fields = []
-            for field in fields_to_update:
-                if field not in unique_fields:
-                    unique_fields.append(field)
-            project.save(update_fields=unique_fields)
+            project.save(update_fields=self._dedupe_update_fields(fields_to_update))
             broadcast_project_event(
                 project.id,
                 {
@@ -387,16 +480,21 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         self._require_lock_owner_or_admin(request.user, project)
         serializer = StartDaemonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        allocated_port = serializer.validated_data.get("allocated_port") or allocate_available_port()
+        allocated_port = serializer.validated_data.get("allocated_port") or project.allocated_port or allocate_available_port()
+        runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port or allocated_port)
 
-        if project.daemon_pid and is_daemon_running(project.daemon_pid):
+        if runtime_status.get("running"):
+            self._mark_daemon_running_intent(project, allocated_port=project.allocated_port or allocated_port)
+            project.save(update_fields=["allocated_port", "daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
             return Response(
                 {
                     "detail": "Daemon is already running for this project.",
                     "daemon_pid": project.daemon_pid,
                     "allocated_port": project.allocated_port,
+                    "daemon_desired_state": project.daemon_desired_state,
+                    "config": self._daemon_config_diagnostics(project),
                 },
-                status=status.HTTP_409_CONFLICT,
+                status=status.HTTP_200_OK,
             )
 
         try:
@@ -409,9 +507,17 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
-        project.allocated_port = allocated_port
-        project.daemon_pid = process.pid
-        project.save(update_fields=["allocated_port", "daemon_pid", "updated_at"])
+        self._mark_daemon_running_intent(project, allocated_port=allocated_port, daemon_pid=process.pid)
+        project.save(
+            update_fields=[
+                "allocated_port",
+                "daemon_pid",
+                "daemon_desired_state",
+                "daemon_stop_requested_at",
+                "daemon_last_heartbeat_at",
+                "updated_at",
+            ],
+        )
 
         return Response(
             {
@@ -419,6 +525,8 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                 "name": project.name,
                 "allocated_port": allocated_port,
                 "daemon_pid": process.pid,
+                "daemon_desired_state": project.daemon_desired_state,
+                "config": self._daemon_config_diagnostics(project),
                 "message": "OpenCode daemon started.",
             },
             status=status.HTTP_200_OK,
@@ -429,42 +537,51 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
         if not project.daemon_pid and not project.allocated_port:
-            return Response({"detail": "No daemon PID or allocated port recorded for this project."}, status=status.HTTP_400_BAD_REQUEST)
-
-        active_runs = list(project.runs.filter(status__in=ACTIVE_RUN_STATUSES).order_by("-created_at"))
-        if active_runs:
-            for run in active_runs:
-                task_id = (run.celery_task_id or "").strip()
-                if task_id:
-                    try:
-                        AsyncResult(task_id).revoke(terminate=True)
-                    except Exception:  # noqa: BLE001
-                        pass
-                run.status = OrchestrationRun.Status.CANCELLED
-                run.current_phase = "Cancelled after daemon stop"
-                run.last_error = "Run cancelled manually when daemon was stopped."
-                run.finished_at = timezone.now()
-                run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
-
-            TaskQueue.objects.filter(run__in=active_runs, status__in=[TaskQueue.Status.QUEUED, TaskQueue.Status.RUNNING, TaskQueue.Status.VERIFYING]).update(
-                status=TaskQueue.Status.FAILED,
-                supervisor_feedback="Task cancelled because daemon was manually stopped.",
+            project.daemon_desired_state = Project.DaemonDesiredState.STOPPED
+            project.daemon_stop_requested_at = timezone.now()
+            project.save(update_fields=["daemon_desired_state", "daemon_stop_requested_at", "updated_at"])
+            return Response(
+                {
+                    "project_id": project.id,
+                    "name": project.name,
+                    "daemon_desired_state": project.daemon_desired_state,
+                    "message": "Daemon is already stopped.",
+                },
+                status=status.HTTP_200_OK,
             )
+
+        self._mark_daemon_stopped_intent(project)
+        project.save(update_fields=["daemon_desired_state", "daemon_stop_requested_at", "updated_at"])
 
         stopped = stop_opencode_daemon(
             project.daemon_pid,
             allocated_port=project.allocated_port,
             project_absolute_path=project.absolute_path,
         )
-        if not stopped:
+        runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port)
+        if not stopped and runtime_status.get("running"):
+            self._mark_daemon_running_intent(project, allocated_port=project.allocated_port, daemon_pid=project.daemon_pid)
+            project.save(
+                update_fields=[
+                    "allocated_port",
+                    "daemon_pid",
+                    "daemon_desired_state",
+                    "daemon_stop_requested_at",
+                    "daemon_last_heartbeat_at",
+                    "updated_at",
+                ],
+            )
             return Response({"detail": "Failed to stop daemon process."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         project.daemon_pid = None
-        project.save(update_fields=["daemon_pid", "updated_at"])
+        project.save(update_fields=["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "updated_at"])
+        self._cancel_active_runs_after_daemon_stop(project)
         return Response(
             {
                 "project_id": project.id,
                 "name": project.name,
+                "daemon_desired_state": project.daemon_desired_state,
+                "config": self._daemon_config_diagnostics(project),
                 "message": "OpenCode daemon stopped.",
             },
             status=status.HTTP_200_OK,
@@ -478,18 +595,28 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         serializer.is_valid(raise_exception=True)
 
         if project.daemon_pid or project.allocated_port:
-            stop_opencode_daemon(
+            stopped = stop_opencode_daemon(
                 project.daemon_pid,
                 allocated_port=project.allocated_port,
                 project_absolute_path=project.absolute_path,
             )
+            if not stopped and daemon_runtime_status(project.daemon_pid, project.allocated_port).get("running"):
+                return Response({"detail": "Failed to stop the existing daemon before restart."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         allocated_port = serializer.validated_data.get("allocated_port") or project.allocated_port or allocate_available_port()
         process = start_opencode_daemon(project.absolute_path, allocated_port)
 
-        project.allocated_port = allocated_port
-        project.daemon_pid = process.pid
-        project.save(update_fields=["allocated_port", "daemon_pid", "updated_at"])
+        self._mark_daemon_running_intent(project, allocated_port=allocated_port, daemon_pid=process.pid)
+        project.save(
+            update_fields=[
+                "allocated_port",
+                "daemon_pid",
+                "daemon_desired_state",
+                "daemon_stop_requested_at",
+                "daemon_last_heartbeat_at",
+                "updated_at",
+            ],
+        )
 
         return Response(
             {
@@ -497,6 +624,8 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                 "name": project.name,
                 "allocated_port": allocated_port,
                 "daemon_pid": process.pid,
+                "daemon_desired_state": project.daemon_desired_state,
+                "config": self._daemon_config_diagnostics(project),
                 "message": "OpenCode daemon restarted.",
             },
             status=status.HTTP_200_OK,
@@ -505,15 +634,29 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
     @action(detail=True, methods=["get"], url_path="daemon-status")
     def daemon_status(self, request, pk=None):
         project = self.get_object()
-        running = is_daemon_running(project.daemon_pid)
-        health = daemon_health(project.allocated_port if running else None)
+        runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port)
+        if runtime_status.get("reachable") or runtime_status.get("healthy"):
+            project.daemon_last_heartbeat_at = timezone.now()
+            project.save(update_fields=["daemon_last_heartbeat_at", "updated_at"])
         return Response(
             {
                 "project_id": project.id,
                 "daemon_pid": project.daemon_pid,
                 "allocated_port": project.allocated_port,
-                "running": running,
-                "health": health,
+                "daemon_desired_state": project.daemon_desired_state,
+                "daemon_last_heartbeat_at": project.daemon_last_heartbeat_at,
+                "daemon_stop_requested_at": project.daemon_stop_requested_at,
+                "running": runtime_status.get("running", False),
+                "pid_alive": runtime_status.get("pid_alive", False),
+                "port_reachable": runtime_status.get("port_reachable", False),
+                "health": {
+                    "reachable": runtime_status.get("reachable", False),
+                    "healthy": runtime_status.get("healthy", False),
+                    "busy": runtime_status.get("busy", False),
+                    "state": runtime_status.get("state", "unreachable"),
+                    "version": runtime_status.get("version"),
+                },
+                "config": self._daemon_config_diagnostics(project),
             },
             status=status.HTTP_200_OK,
         )
@@ -732,7 +875,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.sessions(project.absolute_path)
+            payload = client.sessions(self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -742,7 +885,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.session(session_id, project.absolute_path)
+            payload = client.session(session_id, self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -752,7 +895,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.session_messages(session_id, project.absolute_path)
+            payload = client.session_messages(session_id, self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -762,7 +905,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.session_diff(session_id, project.absolute_path)
+            payload = client.session_diff(session_id, self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -772,7 +915,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.session_status(project.absolute_path)
+            payload = client.session_status(self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -782,8 +925,9 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            sessions_payload = client.sessions(project.absolute_path)
-            status_payload = client.session_status(project.absolute_path)
+            daemon_directory = self._daemon_directory(project)
+            sessions_payload = client.sessions(daemon_directory)
+            status_payload = client.session_status(daemon_directory)
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -895,7 +1039,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                 "summary": {
                     "project_count": projects.count(),
                     "locked_project_count": projects.filter(is_locked=True).count(),
-                    "active_daemon_count": projects.exclude(daemon_pid__isnull=True).count(),
+                    "active_daemon_count": projects.filter(daemon_desired_state=Project.DaemonDesiredState.RUNNING).count(),
                     "run_count": runs.count(),
                     "active_run_count": runs.filter(
                         status__in=[
@@ -933,7 +1077,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         project = self.get_object()
         try:
             client = self._build_opencode_client(project)
-            payload = client.session_todos(session_id, project.absolute_path)
+            payload = client.session_todos(session_id, self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -944,7 +1088,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         self._require_lock_owner_or_admin(request.user, project)
         try:
             client = self._build_opencode_client(project)
-            payload = client.interrupt_session(session_id, project.absolute_path)
+            payload = client.interrupt_session(session_id, self._daemon_directory(project))
         except (OrchestrationError, OpenCodeClientError) as error:
             return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(payload, status=status.HTTP_200_OK)
@@ -959,7 +1103,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             client = self._build_opencode_client(project)
             payload = client.fork_session(
                 session_id,
-                project.absolute_path,
+                self._daemon_directory(project),
                 title=serializer.validated_data.get("title", ""),
                 agent=serializer.validated_data.get("agent", ""),
             )
@@ -977,7 +1121,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             client = self._build_opencode_client(project)
             payload = client.summarize_session(
                 session_id,
-                project.absolute_path,
+                self._daemon_directory(project),
                 serializer.validated_data.get("prompt", ""),
             )
         except (OrchestrationError, OpenCodeClientError) as error:

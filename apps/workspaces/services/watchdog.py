@@ -3,17 +3,31 @@ import os
 import sys
 import threading
 import time
+from collections import defaultdict
 
 from django.conf import settings
 from django.db import close_old_connections
+from django.utils import timezone
 
-from ..models import Project
-from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
+from ..models import OrchestrationRun, Project
+from .daemon import daemon_runtime_status, start_opencode_daemon, stop_opencode_daemon
 from .realtime import broadcast_project_event
 
 logger = logging.getLogger(__name__)
 _watchdog_started = False
 _watchdog_lock = threading.Lock()
+_failure_counts: dict[int, int] = defaultdict(int)
+
+ACTIVE_RUN_STATUSES = {
+    OrchestrationRun.Status.PENDING_APPROVAL,
+    OrchestrationRun.Status.QUEUED,
+    OrchestrationRun.Status.PLANNING,
+    OrchestrationRun.Status.BREAKING_DOWN,
+    OrchestrationRun.Status.PLAN_READY,
+    OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
+    OrchestrationRun.Status.RUNNING,
+    OrchestrationRun.Status.VERIFYING,
+}
 
 
 def start_watchdog_once() -> None:
@@ -72,22 +86,59 @@ def _watchdog_loop() -> None:
 
 
 def _heal_projects() -> None:
-    monitored_projects = Project.objects.exclude(daemon_pid__isnull=True).exclude(allocated_port__isnull=True)
+    failure_threshold = max(1, settings.DAEMON_WATCHDOG_CONSECUTIVE_FAILURE_THRESHOLD)
+    monitored_projects = Project.objects.filter(
+        daemon_desired_state=Project.DaemonDesiredState.RUNNING,
+    ).exclude(allocated_port__isnull=True)
     for project in monitored_projects:
-        pid_alive = is_daemon_running(project.daemon_pid)
-        health = daemon_health(project.allocated_port if pid_alive else None)
-        is_healthy = pid_alive and bool(health.get("healthy"))
+        runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port)
+        has_active_runs = project.runs.filter(status__in=ACTIVE_RUN_STATUSES, finished_at__isnull=True).exists()
+        if runtime_status.get("reachable") or runtime_status.get("healthy"):
+            project.daemon_last_heartbeat_at = timezone.now()
+            project.save(update_fields=["daemon_last_heartbeat_at", "updated_at"])
+
+        is_healthy = runtime_status.get("running") and runtime_status.get("reachable") and runtime_status.get("healthy")
         if is_healthy:
+            _failure_counts.pop(project.id, None)
+            continue
+
+        if runtime_status.get("reachable") and (runtime_status.get("busy") or has_active_runs):
+            logger.info(
+                "Watchdog tolerated busy daemon for project=%s pid=%s port=%s state=%s active_runs=%s",
+                project.name,
+                project.daemon_pid,
+                project.allocated_port,
+                runtime_status.get("state"),
+                has_active_runs,
+            )
+            _failure_counts.pop(project.id, None)
+            continue
+
+        failure_count = _failure_counts[project.id] + 1
+        _failure_counts[project.id] = failure_count
+        if failure_count < failure_threshold:
+            logger.warning(
+                "Watchdog observed unhealthy daemon for project=%s pid=%s port=%s state=%s failure=%s/%s",
+                project.name,
+                project.daemon_pid,
+                project.allocated_port,
+                runtime_status.get("state"),
+                failure_count,
+                failure_threshold,
+            )
             continue
 
         logger.warning(
-            "Watchdog restarting unhealthy daemon for project=%s pid=%s port=%s",
+            "Watchdog restarting unhealthy daemon for project=%s pid=%s port=%s state=%s failure=%s/%s",
             project.name,
             project.daemon_pid,
             project.allocated_port,
+            runtime_status.get("state"),
+            failure_count,
+            failure_threshold,
         )
 
-        if project.daemon_pid:
+        if project.daemon_pid or project.allocated_port:
             stop_opencode_daemon(
                 project.daemon_pid,
                 allocated_port=project.allocated_port,
@@ -97,7 +148,10 @@ def _heal_projects() -> None:
         process = start_opencode_daemon(project.absolute_path, project.allocated_port)
         old_pid = project.daemon_pid
         project.daemon_pid = process.pid
-        project.save(update_fields=["daemon_pid", "updated_at"])
+        project.daemon_stop_requested_at = None
+        project.daemon_last_heartbeat_at = timezone.now()
+        project.save(update_fields=["daemon_pid", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
+        _failure_counts.pop(project.id, None)
 
         broadcast_project_event(
             project.id,

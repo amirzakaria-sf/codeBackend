@@ -10,7 +10,7 @@ from django.utils import timezone
 from opencode_client import OpenCodeClient, diff_to_text, extract_text_from_parts
 
 from ..models import AuditLog, OrchestrationArtifact, OrchestrationPlanStep, OrchestrationRun, OrchestrationRunActivity, OrchestrationStep, Project, TaskQueue
-from .daemon import daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
+from .daemon import daemon_directory_for_project, daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
 from .github_sync import enqueue_github_sync_for_run
 from .notifications import create_user_notification
 from .realtime import broadcast_project_event, broadcast_user_event
@@ -419,6 +419,15 @@ def perform_orchestration_run(run_id: int) -> dict:
     if run.status == OrchestrationRun.Status.CANCELLED:
         record_run_activity(run=run, kind="run.cancelled", message="Run was cancelled before execution started.")
         return {"mode": "cancelled", "run_id": run.id}
+    if run.project.daemon_desired_state == Project.DaemonDesiredState.STOPPED:
+        run.status = OrchestrationRun.Status.CANCELLED
+        run.current_phase = "Cancelled because daemon is stopped"
+        run.last_error = "Run cannot continue while daemon desired state is STOPPED."
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
+        record_run_activity(run=run, kind="run.cancelled", message=run.last_error)
+        send_run_status_event(run.project.id, run)
+        return {"mode": "cancelled", "run_id": run.id}
 
     if not run.project.allocated_port:
         mark_run_failed(run, "Project does not have an allocated OpenCode port.")
@@ -435,7 +444,10 @@ def perform_orchestration_run(run_id: int) -> dict:
             )
         process = start_opencode_daemon(run.project.absolute_path, int(run.project.allocated_port))
         run.project.daemon_pid = process.pid
-        run.project.save(update_fields=["daemon_pid", "updated_at"])
+        run.project.daemon_desired_state = Project.DaemonDesiredState.RUNNING
+        run.project.daemon_stop_requested_at = None
+        run.project.daemon_last_heartbeat_at = timezone.now()
+        run.project.save(update_fields=["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
         record_run_activity(
             run=run,
             kind="daemon.restarted",
@@ -538,6 +550,7 @@ def perform_orchestration_run(run_id: int) -> dict:
 def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: OrchestrationRun) -> dict:
     client = OpenCodeClient(project.allocated_port)
     allowed_worker_agents = _allowed_worker_agents()
+    daemon_directory = daemon_directory_for_project(project.absolute_path)
 
     approved_plan_steps = list(
         run.plan_steps.filter(status=OrchestrationPlanStep.Status.APPROVED).order_by("sequence_order", "id"),
@@ -572,7 +585,7 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     plan_agent = settings.PLAN_AGENT_NAME
     supervisor_agent = settings.SUPERVISOR_AGENT_NAME
 
-    plan_session = client.create_session(project.absolute_path, f"Plan {project.name}", plan_agent)
+    plan_session = client.create_session(daemon_directory, f"Plan {project.name}", plan_agent)
     run.plan_session_id = plan_session["id"]
     run.active_session_id = plan_session["id"]
     run.save(update_fields=["plan_session_id", "active_session_id", "updated_at"])
@@ -584,7 +597,7 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         payload={"agent": plan_agent, "title": f"Plan {project.name}"},
     )
     planner_prompt = _build_planner_prompt(raw_prompt=raw_prompt, allowed_worker_agents=allowed_worker_agents)
-    plan_response = client.prompt(run.plan_session_id, project.absolute_path, planner_prompt, plan_agent)
+    plan_response = client.prompt(run.plan_session_id, daemon_directory, planner_prompt, plan_agent)
     record_artifact(
         run=run,
         artifact_type=OrchestrationArtifact.ArtifactType.MESSAGE,
@@ -597,19 +610,19 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         client=client,
         run=run,
         session_id=run.plan_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
         endpoint="session.message",
         payload=plan_response,
         step=None,
         task=None,
     )
-    client.wait_for_idle(run.plan_session_id, project.absolute_path)
-    _store_session_messages_artifact(client, run=run, session_id=run.plan_session_id, directory=project.absolute_path, label="plan-session-messages")
+    client.wait_for_idle(run.plan_session_id, daemon_directory)
+    _store_session_messages_artifact(client, run=run, session_id=run.plan_session_id, directory=daemon_directory, label="plan-session-messages")
     blueprint = _extract_response_text(
         response_payload=plan_response,
         client=client,
         session_id=run.plan_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
     )
     if not blueprint:
         raise OrchestrationError("Plan agent returned an empty blueprint.")
@@ -633,7 +646,7 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     )
 
     supervisor_session = client.create_session(
-        project.absolute_path,
+        daemon_directory,
         f"Supervisor {project.name}",
         supervisor_agent,
     )
@@ -656,7 +669,7 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
     )
     supervisor_response = client.prompt(
         run.supervisor_session_id,
-        project.absolute_path,
+        daemon_directory,
         supervisor_prompt,
         supervisor_agent,
     )
@@ -672,19 +685,19 @@ def run_orchestration_cycle(project: Project, user, raw_prompt: str, run: Orches
         client=client,
         run=run,
         session_id=run.supervisor_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
         endpoint="session.message",
         payload=supervisor_response,
         step=None,
         task=None,
     )
-    client.wait_for_idle(run.supervisor_session_id, project.absolute_path)
-    _store_session_messages_artifact(client, run=run, session_id=run.supervisor_session_id, directory=project.absolute_path, label="supervisor-session-messages")
+    client.wait_for_idle(run.supervisor_session_id, daemon_directory)
+    _store_session_messages_artifact(client, run=run, session_id=run.supervisor_session_id, directory=daemon_directory, label="supervisor-session-messages")
     supervisor_text = _extract_response_text(
         response_payload=supervisor_response,
         client=client,
         session_id=run.supervisor_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
     )
     steps = _parse_supervisor_steps(supervisor_text)
     if not steps:
@@ -811,9 +824,10 @@ def _execute_planned_steps(
     blueprint: str = "",
 ) -> dict:
     supervisor_agent = settings.SUPERVISOR_AGENT_NAME
+    daemon_directory = daemon_directory_for_project(project.absolute_path)
     if not run.supervisor_session_id:
         supervisor_session = client.create_session(
-            project.absolute_path,
+            daemon_directory,
             f"Supervisor {project.name}",
             supervisor_agent,
         )
@@ -913,6 +927,7 @@ def _execute_step(
     step: dict,
     run: OrchestrationRun,
 ) -> StepResult:
+    daemon_directory = daemon_directory_for_project(project.absolute_path)
     task = TaskQueue.objects.create(
         project=project,
         run=run,
@@ -943,7 +958,7 @@ def _execute_step(
     send_run_status_event(project.id, run)
 
     worker_session = client.create_session(
-        project.absolute_path,
+        daemon_directory,
         f"{step['assigned_agent']} step {step['sequence_order']}",
         step["assigned_agent"],
     )
@@ -1000,25 +1015,25 @@ def _execute_step(
             payload={"attempt": attempt, "assigned_agent": step["assigned_agent"]},
         )
 
-        worker_response = client.prompt(worker_session_id, project.absolute_path, instruction, step["assigned_agent"])
+        worker_response = client.prompt(worker_session_id, daemon_directory, instruction, step["assigned_agent"])
         _capture_usage_with_fallback(
             client=client,
             run=run,
             session_id=worker_session_id,
-            directory=project.absolute_path,
+            directory=daemon_directory,
             endpoint="session.message",
             payload=worker_response,
             step=step_record,
             task=task,
         )
-        client.wait_for_idle(worker_session_id, project.absolute_path)
+        client.wait_for_idle(worker_session_id, daemon_directory)
         _store_session_messages_artifact(
             client,
             run=run,
             step=step_record,
             task=task,
             session_id=worker_session_id,
-            directory=project.absolute_path,
+            directory=daemon_directory,
             label=f"worker-session-messages-attempt-{attempt}",
         )
 
@@ -1037,7 +1052,7 @@ def _execute_step(
         )
         _broadcast_task_status(project, task)
 
-        generated_diff = diff_to_text(client.session_diff(worker_session_id, project.absolute_path))
+        generated_diff = diff_to_text(client.session_diff(worker_session_id, daemon_directory))
         step_record.generated_diff = generated_diff
         step_record.save(update_fields=["generated_diff", "updated_at"])
         record_artifact(
@@ -1063,7 +1078,7 @@ def _execute_step(
         if validation_feedback == "APPROVED":
             shell_payload = client.run_shell_command(
                 worker_session_id,
-                project.absolute_path,
+                daemon_directory,
                 settings.PROJECT_COMPILE_COMMAND,
             )
             record_artifact(
@@ -1177,6 +1192,7 @@ def _validate_step_with_supervisor(
     step_record: OrchestrationStep | None = None,
     task_record: TaskQueue | None = None,
 ) -> str:
+    daemon_directory = daemon_directory_for_project(project.absolute_path)
     expected_artifact_guidance = (
         "If the instruction is primarily conversational/planning/diagnostic and does not require file edits, "
         "do not reject solely because the diff is empty. Approve when the required non-code artifact is present and adequate."
@@ -1188,25 +1204,25 @@ def _validate_step_with_supervisor(
         f"Step instruction:\n{step['instruction']}\n\n"
         f"Generated diff:\n{generated_diff}"
     )
-    response = client.prompt(supervisor_session_id, project.absolute_path, validation_prompt, supervisor_agent)
+    response = client.prompt(supervisor_session_id, daemon_directory, validation_prompt, supervisor_agent)
     _capture_usage_with_fallback(
         client=client,
         run=run,
         session_id=supervisor_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
         endpoint="session.message",
         payload=response,
         step=step_record,
         task=task_record,
     )
-    client.wait_for_idle(supervisor_session_id, project.absolute_path)
+    client.wait_for_idle(supervisor_session_id, daemon_directory)
     _store_session_messages_artifact(
         client,
         run=run,
         step=step_record,
         task=task_record,
         session_id=supervisor_session_id,
-        directory=project.absolute_path,
+        directory=daemon_directory,
         label="supervisor-validation-messages",
     )
     feedback = extract_text_from_parts(response.get("parts", [])) or "Supervisor returned no feedback."
