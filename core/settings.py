@@ -2,6 +2,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 """Django settings for the Foundry-AI orchestrator backend."""
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -217,10 +219,13 @@ ORCHESTRATION_FALLBACK_WORKER_AGENT = os.environ.get('ORCHESTRATION_FALLBACK_WOR
 OPENCODE_DAEMON_SANDBOX_MODE = os.environ.get('OPENCODE_DAEMON_SANDBOX_MODE', 'host').strip().lower()
 OPENCODE_DAEMON_DOCKER_IMAGE = os.environ.get('OPENCODE_DAEMON_DOCKER_IMAGE', '').strip()
 OPENCODE_DAEMON_CONTAINER_WORKDIR = os.environ.get('OPENCODE_DAEMON_CONTAINER_WORKDIR', '/workspace').strip() or '/workspace'
+ENFORCE_DOCKER_SANDBOX_IN_PRODUCTION = os.environ.get('ENFORCE_DOCKER_SANDBOX_IN_PRODUCTION', 'true').lower() == 'true'
 DAEMON_WATCHDOG_ENABLED = os.environ.get('DAEMON_WATCHDOG_ENABLED', 'true').lower() == 'true'
 DAEMON_WATCHDOG_INTERVAL_SECONDS = int(os.environ.get('DAEMON_WATCHDOG_INTERVAL_SECONDS', '20'))
 DAEMON_HEALTHCHECK_TIMEOUT_SECONDS = float(os.environ.get('DAEMON_HEALTHCHECK_TIMEOUT_SECONDS', '15'))
+DAEMON_STARTUP_TIMEOUT_SECONDS = float(os.environ.get('DAEMON_STARTUP_TIMEOUT_SECONDS', '20'))
 DAEMON_WATCHDOG_CONSECUTIVE_FAILURE_THRESHOLD = int(os.environ.get('DAEMON_WATCHDOG_CONSECUTIVE_FAILURE_THRESHOLD', '3'))
+PROJECT_LOCK_STALE_SECONDS = int(os.environ.get('PROJECT_LOCK_STALE_SECONDS', '900'))
 STUCK_RUN_THRESHOLD_SECONDS = int(os.environ.get('STUCK_RUN_THRESHOLD_SECONDS', '180'))
 STUCK_RUN_SCAN_INTERVAL_SECONDS = int(os.environ.get('STUCK_RUN_SCAN_INTERVAL_SECONDS', '30'))
 STUCK_RUN_MAX_RECOVERY_ATTEMPTS = int(os.environ.get('STUCK_RUN_MAX_RECOVERY_ATTEMPTS', '3'))
@@ -248,6 +253,19 @@ CELERY_BEAT_SCHEDULE = {
         'schedule': timedelta(seconds=max(10, STUCK_RUN_SCAN_INTERVAL_SECONDS)),
     },
 }
+
+if not DEBUG and ENFORCE_DOCKER_SANDBOX_IN_PRODUCTION:
+    if OPENCODE_DAEMON_SANDBOX_MODE != 'docker':
+        raise ImproperlyConfigured(
+            'Production runtime requires OPENCODE_DAEMON_SANDBOX_MODE=docker for tenant isolation.',
+        )
+    if not OPENCODE_DAEMON_DOCKER_IMAGE:
+        raise ImproperlyConfigured(
+            'Production runtime requires OPENCODE_DAEMON_DOCKER_IMAGE when docker sandbox mode is enabled.',
+        )
+
+if OPENCODE_DAEMON_SANDBOX_MODE == 'docker' and not OPENCODE_DAEMON_CONTAINER_WORKDIR.startswith('/'):
+    raise ImproperlyConfigured('OPENCODE_DAEMON_CONTAINER_WORKDIR must be an absolute path in docker sandbox mode.')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field

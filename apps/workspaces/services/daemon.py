@@ -6,6 +6,7 @@ import signal
 import socket
 import subprocess
 import time
+from base64 import b64encode
 from hashlib import sha1
 from pathlib import Path
 
@@ -19,6 +20,32 @@ logger = logging.getLogger(__name__)
 
 class DaemonStartError(Exception):
     """Raised when OpenCode daemon startup fails."""
+
+
+def _resolve_server_password() -> str:
+    configured = settings.__dict__.get("OPENCODE_SERVER_PASSWORD") or None
+    if configured:
+        return str(configured).strip()
+
+    try:
+        result = subprocess.run(
+            [settings.OPENCODE_BINARY_PATH, "service", "password"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+    return result.stdout.strip()
+
+
+def _healthcheck_headers() -> dict[str, str]:
+    password = _resolve_server_password()
+    if not password:
+        return {}
+    token = b64encode(f"opencode:{password}".encode("utf-8")).decode("utf-8")
+    return {"Authorization": f"Basic {token}"}
 
 
 def _venv_bin_path(project_root: Path) -> Path | None:
@@ -523,7 +550,11 @@ def daemon_health(port: int | None) -> dict:
 
     timeout_seconds = max(3, float(getattr(settings, "DAEMON_HEALTHCHECK_TIMEOUT_SECONDS", 15)))
     try:
-        response = httpx.get(f"http://127.0.0.1:{port}/global/health", timeout=timeout_seconds)
+        response = httpx.get(
+            f"http://127.0.0.1:{port}/global/health",
+            timeout=timeout_seconds,
+            headers=_healthcheck_headers(),
+        )
         response.raise_for_status()
         payload = response.json()
     except httpx.TimeoutException:

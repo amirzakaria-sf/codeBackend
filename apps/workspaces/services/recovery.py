@@ -11,7 +11,7 @@ from opencode_client import OpenCodeClient, OpenCodeClientError
 
 from ..models import OrchestrationRun, Project, TaskQueue
 from .daemon import daemon_directory_for_project, daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
-from .orchestration import mark_run_failed
+from .orchestration import mark_run_cancelled, mark_run_failed, release_project_lock
 from .realtime import broadcast_project_event
 from .telemetry import record_run_activity, send_run_status_event
 
@@ -55,21 +55,21 @@ def scan_and_enqueue_stuck_runs() -> list[int]:
 def _fail_and_unlock_if_orphaned(run: OrchestrationRun, *, threshold_seconds: int) -> bool:
     task_id = (run.celery_task_id or "").strip()
     if not task_id:
-        mark_run_failed(run, "Run is stuck without an active Celery task id.")
-        _unlock_project(run.project)
+        mark_run_failed(run, "Run is stuck without an active Celery task id. Worker crash or broker desync suspected.")
+        release_project_lock(run.project, reason="worker_crashed")
         return True
 
     task_state = AsyncResult(task_id).state
     if task_state in TERMINAL_TASK_STATES:
         mark_run_failed(run, f"Run task {task_id} ended in state '{task_state}' before orchestration reached a terminal run status.")
-        _unlock_project(run.project)
+        release_project_lock(run.project, reason="worker_crashed")
         return True
 
     if task_state == "PENDING":
         stale_pending_cutoff = timezone.now() - timedelta(seconds=max(threshold_seconds * 2, threshold_seconds + 120))
         if run.updated_at < stale_pending_cutoff:
             mark_run_failed(run, "Run remained in pending Celery state beyond recovery timeout window.")
-            _unlock_project(run.project)
+            release_project_lock(run.project, reason="worker_crashed")
             return True
 
     return False
@@ -82,14 +82,19 @@ def recover_stuck_run(run_id: int) -> dict:
     if run.status in {OrchestrationRun.Status.COMPLETED, OrchestrationRun.Status.FAILED, OrchestrationRun.Status.CANCELLED}:
         return {"mode": "finished", "run_id": run.id, "status": run.status}
     if run.project.daemon_desired_state == Project.DaemonDesiredState.STOPPED:
-        mark_run_failed(run, "Automated recovery skipped because daemon desired state is STOPPED.")
-        _unlock_project(run.project)
+        mark_run_cancelled(
+            run,
+            reason=OrchestrationRun.CancellationReason.DAEMON_STOPPED,
+            message="Automated recovery skipped because daemon desired state is STOPPED.",
+            activity_kind="run.cancelled.daemon_stopped",
+        )
+        release_project_lock(run.project, reason="daemon_stopped")
         return {"mode": "failed", "run_id": run.id, "reason": "daemon_stopped"}
 
     max_attempts = max(1, settings.STUCK_RUN_MAX_RECOVERY_ATTEMPTS)
     if run.stuck_recovery_count >= max_attempts:
         mark_run_failed(run, "Run exceeded maximum automated recovery attempts.")
-        _unlock_project(run.project)
+        release_project_lock(run.project, reason="recovery_exhausted")
         return {"mode": "failed", "run_id": run.id, "reason": "max_attempts_exceeded"}
 
     attempt_number = run.stuck_recovery_count + 1
@@ -140,7 +145,7 @@ def recover_stuck_run(run_id: int) -> dict:
         send_run_status_event(run.project.id, run)
         if run.stuck_recovery_count >= max_attempts:
             mark_run_failed(run, f"Recovery attempts exhausted: {error}")
-            _unlock_project(run.project)
+            release_project_lock(run.project, reason="recovery_exhausted")
             return {"mode": "failed", "run_id": run.id, "error": str(error)}
         return {"mode": "recovery_failed", "run_id": run.id, "attempt": attempt_number, "error": str(error)}
 
@@ -219,17 +224,4 @@ def _resolve_recovery_agent(run: OrchestrationRun) -> str:
 
 
 def _unlock_project(project: Project) -> None:
-    with transaction.atomic():
-        project.is_locked = False
-        project.locked_by = None
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-
-    broadcast_project_event(
-        project.id,
-        {
-            "kind": "lock_status_changed",
-            "project_id": project.id,
-            "is_locked": False,
-            "locked_by": None,
-        },
-    )
+    release_project_lock(project, reason="recovery_unlock")

@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from ..models import OrchestrationRun, Project
 from .daemon import daemon_runtime_status, start_opencode_daemon, stop_opencode_daemon
+from .orchestration import expire_project_lock_if_stale, fail_active_runs_for_project, release_project_lock
 from .realtime import broadcast_project_event
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,8 @@ def _heal_projects() -> None:
     for project in monitored_projects:
         runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port)
         has_active_runs = project.runs.filter(status__in=ACTIVE_RUN_STATUSES, finished_at__isnull=True).exists()
+        if not has_active_runs:
+            expire_project_lock_if_stale(project, runtime_status=runtime_status)
         if runtime_status.get("reachable") or runtime_status.get("healthy"):
             project.daemon_last_heartbeat_at = timezone.now()
             project.save(update_fields=["daemon_last_heartbeat_at", "updated_at"])
@@ -144,8 +147,29 @@ def _heal_projects() -> None:
                 allocated_port=project.allocated_port,
                 project_absolute_path=project.absolute_path,
             )
+        try:
+            process = start_opencode_daemon(project.absolute_path, project.allocated_port)
+        except Exception as error:  # noqa: BLE001
+            logger.exception("Watchdog failed to restart daemon for project=%s: %s", project.name, error)
+            failed_run_ids = fail_active_runs_for_project(
+                project,
+                message=f"Daemon crashed and watchdog restart failed: {error}",
+                activity_kind="daemon.restart_failed",
+            )
+            release_project_lock(project, reason="daemon_restart_failed")
+            broadcast_project_event(
+                project.id,
+                {
+                    "kind": "daemon_restart_failed",
+                    "project_id": project.id,
+                    "allocated_port": project.allocated_port,
+                    "failed_run_ids": failed_run_ids,
+                    "error": str(error),
+                },
+            )
+            _failure_counts.pop(project.id, None)
+            continue
 
-        process = start_opencode_daemon(project.absolute_path, project.allocated_port)
         old_pid = project.daemon_pid
         project.daemon_pid = process.pid
         project.daemon_stop_requested_at = None

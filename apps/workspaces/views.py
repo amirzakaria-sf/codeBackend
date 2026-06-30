@@ -52,7 +52,12 @@ from .services.orchestration import (
     OrchestrationError,
     approve_plan_for_run,
     approve_pending_task,
+    cancel_active_runs_for_project,
+    expire_project_lock_if_stale,
     execute_or_queue_project_prompt,
+    fail_active_runs_for_project,
+    mark_project_locked,
+    release_project_lock,
     request_replan_for_run,
     reject_pending_task,
 )
@@ -207,54 +212,27 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             }
 
     @staticmethod
-    def _cancel_active_runs_after_daemon_stop(project: Project) -> None:
-        active_runs = list(project.runs.filter(status__in=ACTIVE_RUN_STATUSES).order_by("-created_at"))
-        if not active_runs:
-            return
-
-        finished_at = timezone.now()
-        for run in active_runs:
-            task_id = (run.celery_task_id or "").strip()
-            if task_id:
-                try:
-                    AsyncResult(task_id).revoke(terminate=True)
-                except Exception:  # noqa: BLE001
-                    pass
-            run.status = OrchestrationRun.Status.CANCELLED
-            run.current_phase = "Cancelled after daemon stop"
-            run.last_error = "Run cancelled manually when daemon was stopped."
-            run.finished_at = finished_at
-            run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
-            send_run_status_event(project.id, run)
-
-        TaskQueue.objects.filter(run__in=active_runs, status__in=[TaskQueue.Status.QUEUED, TaskQueue.Status.RUNNING, TaskQueue.Status.VERIFYING]).update(
-            status=TaskQueue.Status.FAILED,
-            supervisor_feedback="Task cancelled because daemon was manually stopped.",
+    def _cancel_active_runs_after_daemon_stop(project: Project) -> list[int]:
+        cancelled_run_ids = cancel_active_runs_for_project(
+            project,
+            reason=OrchestrationRun.CancellationReason.MANUAL_DAEMON_STOP,
+            message="Run cancelled manually when daemon was stopped.",
+            activity_kind="run.cancelled.manual_daemon_stop",
         )
-
-        if project.is_locked:
-            project.is_locked = False
-            project.locked_by = None
-            project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-            broadcast_project_event(
-                project.id,
-                {
-                    "kind": "lock_status_changed",
-                    "project_id": project.id,
-                    "is_locked": False,
-                    "locked_by": None,
-                },
-            )
+        release_project_lock(project, reason="manual_daemon_stop")
+        return cancelled_run_ids
 
     def _ensure_runtime_ready(self, project: Project, user) -> Project:
         if project.is_locked and project.locked_by_id and project.locked_by_id != user.id and not (user.is_staff or user.is_superuser):
-            raise PermissionDenied("Workspace is locked by another user.")
+            stale_runtime_status = daemon_runtime_status(project.daemon_pid, project.allocated_port)
+            expire_project_lock_if_stale(project, runtime_status=stale_runtime_status)
+            project.refresh_from_db()
+            if project.is_locked and project.locked_by_id and project.locked_by_id != user.id:
+                raise PermissionDenied("Workspace is locked by another user.")
 
         fields_to_update: list[str] = []
-        if not project.is_locked or project.locked_by_id != user.id:
-            project.is_locked = True
-            project.locked_by = user
-            fields_to_update.extend(["is_locked", "locked_by", "updated_at"])
+        lock_was_owned_by_user = project.is_locked and project.locked_by_id == user.id
+        mark_project_locked(project, user=user)
 
         if not project.allocated_port:
             project.allocated_port = allocate_available_port()
@@ -272,18 +250,24 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                 fields_to_update.extend(["daemon_last_heartbeat_at", "updated_at"])
 
         if not runtime_status.get("running") or not runtime_status.get("reachable") or not runtime_status.get("healthy"):
-            if project.daemon_pid:
-                stop_opencode_daemon(
-                    project.daemon_pid,
-                    allocated_port=project.allocated_port,
-                    project_absolute_path=project.absolute_path,
-                )
-            process = start_opencode_daemon(project.absolute_path, port)
+            try:
+                if project.daemon_pid:
+                    stop_opencode_daemon(
+                        project.daemon_pid,
+                        allocated_port=project.allocated_port,
+                        project_absolute_path=project.absolute_path,
+                    )
+                process = start_opencode_daemon(project.absolute_path, port)
+            except Exception:
+                release_project_lock(project, reason="runtime_prepare_failed")
+                raise
             self._mark_daemon_running_intent(project, daemon_pid=process.pid)
             fields_to_update.extend(["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "daemon_last_heartbeat_at", "updated_at"])
 
         if fields_to_update:
             project.save(update_fields=self._dedupe_update_fields(fields_to_update))
+
+        if not lock_was_owned_by_user:
             broadcast_project_event(
                 project.id,
                 {
@@ -321,6 +305,10 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         force = serializer.validated_data["force"]
 
         if project.is_locked:
+            if project.locked_by_id != request.user.id:
+                expire_project_lock_if_stale(project, runtime_status=daemon_runtime_status(project.daemon_pid, project.allocated_port))
+                project.refresh_from_db()
+        if project.is_locked:
             if project.locked_by_id == request.user.id:
                 return Response(
                     {
@@ -339,9 +327,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                     status=status.HTTP_409_CONFLICT,
                 )
 
-        project.is_locked = True
-        project.locked_by = request.user
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        mark_project_locked(project, user=request.user)
         broadcast_project_event(
             project.id,
             {
@@ -374,18 +360,7 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
             )
 
         self._require_lock_owner_or_admin(request.user, project)
-        project.is_locked = False
-        project.locked_by = None
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-        broadcast_project_event(
-            project.id,
-            {
-                "kind": "lock_status_changed",
-                "project_id": project.id,
-                "is_locked": False,
-                "locked_by": None,
-            },
-        )
+        release_project_lock(project, reason="manual_lock_release")
 
         return Response(
             {
@@ -536,10 +511,32 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
     def stop_daemon(self, request, pk=None):
         project = self.get_object()
         self._require_lock_owner_or_admin(request.user, project)
+        broadcast_project_event(
+            project.id,
+            {
+                "kind": "daemon_stop_requested",
+                "project_id": project.id,
+                "daemon_pid": project.daemon_pid,
+                "allocated_port": project.allocated_port,
+                "requested_by": request.user.username,
+            },
+        )
         if not project.daemon_pid and not project.allocated_port:
             project.daemon_desired_state = Project.DaemonDesiredState.STOPPED
             project.daemon_stop_requested_at = timezone.now()
             project.save(update_fields=["daemon_desired_state", "daemon_stop_requested_at", "updated_at"])
+            cancelled_run_ids = self._cancel_active_runs_after_daemon_stop(project)
+            broadcast_project_event(
+                project.id,
+                {
+                    "kind": "daemon_stopped",
+                    "project_id": project.id,
+                    "daemon_pid": None,
+                    "allocated_port": project.allocated_port,
+                    "cancelled_run_ids": cancelled_run_ids,
+                    "requested_by": request.user.username,
+                },
+            )
             return Response(
                 {
                     "project_id": project.id,
@@ -571,11 +568,32 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
                     "updated_at",
                 ],
             )
+            broadcast_project_event(
+                project.id,
+                {
+                    "kind": "daemon_stop_failed",
+                    "project_id": project.id,
+                    "daemon_pid": project.daemon_pid,
+                    "allocated_port": project.allocated_port,
+                    "requested_by": request.user.username,
+                },
+            )
             return Response({"detail": "Failed to stop daemon process."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         project.daemon_pid = None
         project.save(update_fields=["daemon_pid", "daemon_desired_state", "daemon_stop_requested_at", "updated_at"])
-        self._cancel_active_runs_after_daemon_stop(project)
+        cancelled_run_ids = self._cancel_active_runs_after_daemon_stop(project)
+        broadcast_project_event(
+            project.id,
+            {
+                "kind": "daemon_stopped",
+                "project_id": project.id,
+                "daemon_pid": None,
+                "allocated_port": project.allocated_port,
+                "cancelled_run_ids": cancelled_run_ids,
+                "requested_by": request.user.username,
+            },
+        )
         return Response(
             {
                 "project_id": project.id,
@@ -594,17 +612,37 @@ class ProjectViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.
         serializer = StartDaemonSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        if project.daemon_pid or project.allocated_port:
-            stopped = stop_opencode_daemon(
-                project.daemon_pid,
-                allocated_port=project.allocated_port,
-                project_absolute_path=project.absolute_path,
-            )
-            if not stopped and daemon_runtime_status(project.daemon_pid, project.allocated_port).get("running"):
-                return Response({"detail": "Failed to stop the existing daemon before restart."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
         allocated_port = serializer.validated_data.get("allocated_port") or project.allocated_port or allocate_available_port()
-        process = start_opencode_daemon(project.absolute_path, allocated_port)
+        try:
+            if project.daemon_pid or project.allocated_port:
+                stopped = stop_opencode_daemon(
+                    project.daemon_pid,
+                    allocated_port=project.allocated_port,
+                    project_absolute_path=project.absolute_path,
+                )
+                if not stopped and daemon_runtime_status(project.daemon_pid, project.allocated_port).get("running"):
+                    release_project_lock(project, reason="daemon_restart_stop_failed")
+                    broadcast_project_event(
+                        project.id,
+                        {
+                            "kind": "daemon_stop_failed",
+                            "project_id": project.id,
+                            "daemon_pid": project.daemon_pid,
+                            "allocated_port": project.allocated_port,
+                            "requested_by": request.user.username,
+                        },
+                    )
+                    return Response({"detail": "Failed to stop the existing daemon before restart."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            process = start_opencode_daemon(project.absolute_path, allocated_port)
+        except (ProvisioningError, DaemonStartError) as error:
+            fail_active_runs_for_project(project, message=f"Daemon restart failed: {error}", activity_kind="daemon.restart_failed")
+            release_project_lock(project, reason="daemon_restart_failed")
+            return Response({"detail": str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as error:  # noqa: BLE001
+            fail_active_runs_for_project(project, message=f"Daemon restart failed: {error}", activity_kind="daemon.restart_failed")
+            release_project_lock(project, reason="daemon_restart_failed")
+            return Response({"detail": f"Unexpected daemon restart error: {error}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         self._mark_daemon_running_intent(project, allocated_port=allocated_port, daemon_pid=process.pid)
         project.save(

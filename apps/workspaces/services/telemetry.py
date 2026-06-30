@@ -121,6 +121,7 @@ def send_run_status_event(project_id: int, run: OrchestrationRun) -> None:
             "project_id": project_id,
             "run_id": run.id,
             "status": run.status,
+            "cancellation_reason": run.cancellation_reason,
             "current_phase": run.current_phase,
             "progress_percent": run.progress_percent,
             "total_steps": run.total_steps,

@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from celery.result import AsyncResult
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
@@ -108,9 +109,7 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
         }
 
     with transaction.atomic():
-        project.is_locked = True
-        project.locked_by = user
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        mark_project_locked(project, user=user)
         run = OrchestrationRun.objects.create(
             project=project,
             user=user,
@@ -141,19 +140,8 @@ def execute_or_queue_project_prompt(project: Project, user, prompt: str) -> dict
     try:
         task_result = _enqueue_run(run)
     except Exception as error:  # noqa: BLE001
-        project.is_locked = False
-        project.locked_by = None
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        release_project_lock(project, reason="enqueue_failed")
         mark_run_failed(run, f"Failed to enqueue background run: {error}")
-        broadcast_project_event(
-            project.id,
-            {
-                "kind": "lock_status_changed",
-                "project_id": project.id,
-                "is_locked": False,
-                "locked_by": None,
-            },
-        )
         raise OrchestrationError(str(error)) from error
     run.celery_task_id = task_result.id
     run.save(update_fields=["celery_task_id", "updated_at"])
@@ -180,9 +168,7 @@ def approve_pending_task(project: Project, task: TaskQueue, approver) -> dict:
 
     requester = task.user or approver
     with transaction.atomic():
-        project.is_locked = True
-        project.locked_by = requester
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        mark_project_locked(project, user=requester)
         task.status = TaskQueue.Status.QUEUED
         task.supervisor_feedback = f"Approved by {approver.username}."
         task.save(update_fields=["status", "supervisor_feedback", "updated_at"])
@@ -223,19 +209,8 @@ def approve_pending_task(project: Project, task: TaskQueue, approver) -> dict:
     try:
         task_result = _enqueue_run(run)
     except Exception as error:  # noqa: BLE001
-        project.is_locked = False
-        project.locked_by = None
-        project.save(update_fields=["is_locked", "locked_by", "updated_at"])
+        release_project_lock(project, reason="approved_enqueue_failed")
         mark_run_failed(run, f"Failed to enqueue approved run: {error}")
-        broadcast_project_event(
-            project.id,
-            {
-                "kind": "lock_status_changed",
-                "project_id": project.id,
-                "is_locked": False,
-                "locked_by": None,
-            },
-        )
         raise OrchestrationError(str(error)) from error
     run.celery_task_id = task_result.id
     run.save(update_fields=["celery_task_id", "updated_at"])
@@ -420,13 +395,13 @@ def perform_orchestration_run(run_id: int) -> dict:
         record_run_activity(run=run, kind="run.cancelled", message="Run was cancelled before execution started.")
         return {"mode": "cancelled", "run_id": run.id}
     if run.project.daemon_desired_state == Project.DaemonDesiredState.STOPPED:
-        run.status = OrchestrationRun.Status.CANCELLED
-        run.current_phase = "Cancelled because daemon is stopped"
-        run.last_error = "Run cannot continue while daemon desired state is STOPPED."
-        run.finished_at = timezone.now()
-        run.save(update_fields=["status", "current_phase", "last_error", "finished_at", "updated_at"])
-        record_run_activity(run=run, kind="run.cancelled", message=run.last_error)
-        send_run_status_event(run.project.id, run)
+        mark_run_cancelled(
+            run,
+            reason=OrchestrationRun.CancellationReason.DAEMON_STOPPED,
+            message="Run cannot continue while daemon desired state is STOPPED.",
+            activity_kind="run.cancelled.daemon_stopped",
+        )
+        release_project_lock(run.project, reason="run_cancelled_daemon_stopped")
         return {"mode": "cancelled", "run_id": run.id}
 
     if not run.project.allocated_port:
@@ -436,13 +411,19 @@ def perform_orchestration_run(run_id: int) -> dict:
     daemon_running = is_daemon_running(run.project.daemon_pid)
     health = daemon_health(run.project.allocated_port) if daemon_running else {"reachable": False, "healthy": False}
     if not daemon_running or not health.get("reachable") or not health.get("healthy"):
-        if run.project.daemon_pid:
-            stop_opencode_daemon(
-                run.project.daemon_pid,
-                allocated_port=run.project.allocated_port,
-                project_absolute_path=run.project.absolute_path,
-            )
-        process = start_opencode_daemon(run.project.absolute_path, int(run.project.allocated_port))
+        try:
+            if run.project.daemon_pid:
+                stop_opencode_daemon(
+                    run.project.daemon_pid,
+                    allocated_port=run.project.allocated_port,
+                    project_absolute_path=run.project.absolute_path,
+                )
+            process = start_opencode_daemon(run.project.absolute_path, int(run.project.allocated_port))
+        except Exception as error:  # noqa: BLE001
+            mark_run_failed(run, f"Daemon restart failed before orchestration execution: {error}")
+            release_project_lock(run.project, reason="daemon_restart_failed")
+            raise OrchestrationError(str(error)) from error
+
         run.project.daemon_pid = process.pid
         run.project.daemon_desired_state = Project.DaemonDesiredState.RUNNING
         run.project.daemon_stop_requested_at = None
@@ -453,6 +434,15 @@ def perform_orchestration_run(run_id: int) -> dict:
             kind="daemon.restarted",
             message="Daemon restarted before orchestration execution.",
             payload={"daemon_pid": process.pid, "allocated_port": run.project.allocated_port},
+        )
+        broadcast_project_event(
+            run.project.id,
+            {
+                "kind": "daemon_recovered",
+                "project_id": run.project.id,
+                "new_pid": process.pid,
+                "allocated_port": run.project.allocated_port,
+            },
         )
 
     if not run.user_id:
@@ -474,18 +464,7 @@ def perform_orchestration_run(run_id: int) -> dict:
         result = run_orchestration_cycle(project=run.project, user=run.user, raw_prompt=run.prompt, run=run)
     except Exception as error:  # noqa: BLE001
         mark_run_failed(run, str(error))
-        run.project.is_locked = False
-        run.project.locked_by = None
-        run.project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-        broadcast_project_event(
-            run.project.id,
-            {
-                "kind": "lock_status_changed",
-                "project_id": run.project.id,
-                "is_locked": False,
-                "locked_by": None,
-            },
-        )
+        release_project_lock(run.project, reason="run_failed")
         raise
 
     run.refresh_from_db(fields=["total_steps", "completed_steps", "failed_steps", "progress_percent", "current_phase", "status", "updated_at"])
@@ -494,18 +473,7 @@ def perform_orchestration_run(run_id: int) -> dict:
     outcome_error = _evaluate_run_outcome(run)
     if outcome_error:
         mark_run_failed(run, outcome_error)
-        run.project.is_locked = False
-        run.project.locked_by = None
-        run.project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-        broadcast_project_event(
-            run.project.id,
-            {
-                "kind": "lock_status_changed",
-                "project_id": run.project.id,
-                "is_locked": False,
-                "locked_by": None,
-            },
-        )
+        release_project_lock(run.project, reason="run_failed_outcome")
         raise OrchestrationError(outcome_error)
 
     transition_run(
@@ -519,18 +487,7 @@ def perform_orchestration_run(run_id: int) -> dict:
         activity_payload={"completed_steps": run.completed_steps, "failed_steps": run.failed_steps, "total_steps": run.total_steps},
     )
 
-    run.project.is_locked = False
-    run.project.locked_by = None
-    run.project.save(update_fields=["is_locked", "locked_by", "updated_at"])
-    broadcast_project_event(
-        run.project.id,
-        {
-            "kind": "lock_status_changed",
-            "project_id": run.project.id,
-            "is_locked": False,
-            "locked_by": None,
-        },
-    )
+    release_project_lock(run.project, reason="run_completed")
 
     if run.user_id:
         create_user_notification(
@@ -1510,7 +1467,151 @@ def _enqueue_run(run: OrchestrationRun):
     return execute_orchestration_run_task.delay(run.id)
 
 
+def mark_project_locked(project: Project, *, user) -> None:
+    project.is_locked = True
+    project.locked_by = user
+    project.lock_acquired_at = timezone.now()
+    project.save(update_fields=["is_locked", "locked_by", "lock_acquired_at", "updated_at"])
+
+
+def release_project_lock(project: Project, *, reason: str = "") -> None:
+    if not project.is_locked and not project.locked_by_id and not project.lock_acquired_at:
+        return
+
+    project.is_locked = False
+    project.locked_by = None
+    project.lock_acquired_at = None
+    project.save(update_fields=["is_locked", "locked_by", "lock_acquired_at", "updated_at"])
+    broadcast_project_event(
+        project.id,
+        {
+            "kind": "lock_status_changed",
+            "project_id": project.id,
+            "is_locked": False,
+            "locked_by": None,
+            "reason": reason,
+        },
+    )
+
+
+def expire_project_lock_if_stale(project: Project, *, runtime_status: dict | None = None) -> bool:
+    threshold_seconds = max(60, int(getattr(settings, "PROJECT_LOCK_STALE_SECONDS", 900)))
+    if not project.is_locked or not project.lock_acquired_at:
+        return False
+    if project.runs.filter(status__in=_active_run_statuses(), finished_at__isnull=True).exists():
+        return False
+
+    runtime = runtime_status or daemon_health(project.allocated_port if project.allocated_port else None)
+    age_seconds = (timezone.now() - project.lock_acquired_at).total_seconds()
+    daemon_seems_active = bool(runtime.get("running") or runtime.get("reachable") or runtime.get("healthy"))
+    if age_seconds < threshold_seconds or daemon_seems_active:
+        return False
+
+    release_project_lock(project, reason="stale_lock_expired")
+    broadcast_project_event(
+        project.id,
+        {
+            "kind": "lock_expired",
+            "project_id": project.id,
+            "age_seconds": int(age_seconds),
+        },
+    )
+    return True
+
+
+def cancel_active_runs_for_project(
+    project: Project,
+    *,
+    reason: str,
+    message: str,
+    activity_kind: str,
+    event_kind: str = "run_cancelled_by_daemon_stop",
+) -> list[int]:
+    active_runs = list(project.runs.filter(status__in=_active_run_statuses(), finished_at__isnull=True).order_by("-created_at"))
+    cancelled_run_ids: list[int] = []
+    for run in active_runs:
+        task_id = (run.celery_task_id or "").strip()
+        if task_id:
+            try:
+                AsyncResult(task_id).revoke(terminate=True)
+            except Exception:  # noqa: BLE001
+                pass
+        mark_run_cancelled(run, reason=reason, message=message, activity_kind=activity_kind)
+        broadcast_project_event(
+            project.id,
+            {
+                "kind": event_kind,
+                "project_id": project.id,
+                "run_id": run.id,
+                "reason": reason,
+                "message": message,
+            },
+        )
+        cancelled_run_ids.append(run.id)
+    return cancelled_run_ids
+
+
+def fail_active_runs_for_project(project: Project, *, message: str, activity_kind: str) -> list[int]:
+    active_runs = list(project.runs.filter(status__in=_active_run_statuses(), finished_at__isnull=True).order_by("-created_at"))
+    failed_run_ids: list[int] = []
+    for run in active_runs:
+        mark_run_failed(run, message)
+        record_run_activity(
+            run=run,
+            kind=activity_kind,
+            message=message,
+            level=OrchestrationRunActivity.Level.ERROR,
+        )
+        failed_run_ids.append(run.id)
+    return failed_run_ids
+
+
+def mark_run_cancelled(
+    run: OrchestrationRun,
+    *,
+    reason: str,
+    message: str,
+    activity_kind: str = "run.cancelled",
+) -> None:
+    run.cancellation_reason = reason
+    run.save(update_fields=["cancellation_reason", "updated_at"])
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.CANCELLED,
+        current_phase="Cancelled",
+        last_error=message,
+        progress_percent=min(run.progress_percent, 99),
+        finished=True,
+        activity_kind=activity_kind,
+        activity_message=message,
+        activity_level=OrchestrationRunActivity.Level.WARNING,
+        activity_payload={"cancellation_reason": reason},
+    )
+    _mark_incomplete_work_failed(run, message)
+    _refresh_run_step_counters(run)
+    record_artifact(
+        run=run,
+        artifact_type=OrchestrationArtifact.ArtifactType.ERROR,
+        label="run-cancelled",
+        content=message,
+        payload={"cancellation_reason": reason},
+    )
+    if run.user_id:
+        create_user_notification(
+            user=run.user,
+            kind="run_cancelled",
+            title=f"Run #{run.id} cancelled",
+            message=message,
+            project=run.project,
+            run=run,
+            payload={"run_id": run.id, "cancellation_reason": reason},
+        )
+
+
 def mark_run_failed(run: OrchestrationRun, error_message: str) -> None:
+    if run.cancellation_reason:
+        run.cancellation_reason = OrchestrationRun.CancellationReason.NONE
+        run.save(update_fields=["cancellation_reason", "updated_at"])
     transition_run(
         run=run,
         status=OrchestrationRun.Status.FAILED,
@@ -1522,6 +1623,8 @@ def mark_run_failed(run: OrchestrationRun, error_message: str) -> None:
         activity_message=error_message,
         activity_level=OrchestrationRunActivity.Level.ERROR,
     )
+    _mark_incomplete_work_failed(run, error_message)
+    _refresh_run_step_counters(run)
     record_artifact(
         run=run,
         artifact_type=OrchestrationArtifact.ArtifactType.ERROR,
@@ -1538,6 +1641,57 @@ def mark_run_failed(run: OrchestrationRun, error_message: str) -> None:
             run=run,
             payload={"run_id": run.id},
         )
+
+
+def _mark_incomplete_work_failed(run: OrchestrationRun, message: str) -> None:
+    active_task_statuses = [
+        TaskQueue.Status.PENDING_APPROVAL,
+        TaskQueue.Status.QUEUED,
+        TaskQueue.Status.RUNNING,
+        TaskQueue.Status.VERIFYING,
+    ]
+    active_step_statuses = [
+        TaskQueue.Status.QUEUED,
+        TaskQueue.Status.RUNNING,
+        TaskQueue.Status.VERIFYING,
+    ]
+    impacted_tasks = list(run.queue_entries.filter(status__in=active_task_statuses).order_by("sequence_order", "id"))
+    if impacted_tasks:
+        run.queue_entries.filter(pk__in=[task.id for task in impacted_tasks]).update(
+            status=TaskQueue.Status.FAILED,
+            supervisor_feedback=message,
+        )
+        for task in impacted_tasks:
+            task.status = TaskQueue.Status.FAILED
+            task.supervisor_feedback = message
+            _broadcast_task_status(run.project, task)
+
+    run.steps.filter(status__in=active_step_statuses).update(
+        status=TaskQueue.Status.FAILED,
+        supervisor_feedback=message,
+    )
+
+
+def _refresh_run_step_counters(run: OrchestrationRun) -> None:
+    completed_steps = run.steps.filter(status=TaskQueue.Status.COMPLETED).count()
+    failed_steps = run.steps.filter(status=TaskQueue.Status.FAILED).count()
+    run.completed_steps = completed_steps
+    run.failed_steps = failed_steps
+    run.save(update_fields=["completed_steps", "failed_steps", "updated_at"])
+    send_run_status_event(run.project_id, run)
+
+
+def _active_run_statuses() -> list[str]:
+    return [
+        OrchestrationRun.Status.PENDING_APPROVAL,
+        OrchestrationRun.Status.QUEUED,
+        OrchestrationRun.Status.PLANNING,
+        OrchestrationRun.Status.BREAKING_DOWN,
+        OrchestrationRun.Status.PLAN_READY,
+        OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
+        OrchestrationRun.Status.RUNNING,
+        OrchestrationRun.Status.VERIFYING,
+    ]
 
 
 def _progress_for_run(run: OrchestrationRun, active_step: int | None = None, verifying: bool = False) -> int:

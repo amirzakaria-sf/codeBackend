@@ -60,6 +60,7 @@ class Project(models.Model):
     daemon_last_heartbeat_at = models.DateTimeField(null=True, blank=True)
     daemon_stop_requested_at = models.DateTimeField(null=True, blank=True)
     is_locked = models.BooleanField(default=False)
+    lock_acquired_at = models.DateTimeField(null=True, blank=True)
     locked_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         null=True,
@@ -157,6 +158,15 @@ class OrchestrationRun(models.Model):
         FAILED = "FAILED", "Failed"
         CANCELLED = "CANCELLED", "Cancelled"
 
+    class CancellationReason(models.TextChoices):
+        NONE = "", "Not cancelled"
+        MANUAL_DAEMON_STOP = "MANUAL_DAEMON_STOP", "Manual daemon stop"
+        DAEMON_STOPPED = "DAEMON_STOPPED", "Daemon stopped"
+        DAEMON_CRASHED = "DAEMON_CRASHED", "Daemon crashed"
+        DAEMON_RESTART_FAILED = "DAEMON_RESTART_FAILED", "Daemon restart failed"
+        WORKER_CRASHED = "WORKER_CRASHED", "Worker crashed"
+        RECOVERY_EXHAUSTED = "RECOVERY_EXHAUSTED", "Recovery exhausted"
+
     project = models.ForeignKey(
         Project,
         on_delete=models.CASCADE,
@@ -196,6 +206,12 @@ class OrchestrationRun(models.Model):
     supervisor_session_id = models.CharField(max_length=255, blank=True, default="")
     active_session_id = models.CharField(max_length=255, blank=True, default="")
     blueprint = models.TextField(blank=True, default="")
+    cancellation_reason = models.CharField(
+        max_length=64,
+        choices=CancellationReason.choices,
+        blank=True,
+        default=CancellationReason.NONE,
+    )
     last_error = models.TextField(blank=True, default="")
     prompt_tokens = models.PositiveIntegerField(default=0)
     completion_tokens = models.PositiveIntegerField(default=0)
