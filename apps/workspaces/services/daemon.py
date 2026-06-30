@@ -7,6 +7,7 @@ import socket
 import subprocess
 import time
 from base64 import b64encode
+from functools import lru_cache
 from hashlib import sha1
 from pathlib import Path
 
@@ -46,6 +47,43 @@ def _healthcheck_headers() -> dict[str, str]:
         return {}
     token = b64encode(f"opencode:{password}".encode("utf-8")).decode("utf-8")
     return {"Authorization": f"Basic {token}"}
+
+
+@lru_cache(maxsize=16)
+def _opencode_supports_config_flag(opencode_binary: str, opencode_subcommand: str) -> bool:
+    try:
+        result = subprocess.run(
+            [opencode_binary, opencode_subcommand, "--help"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+    help_text = "\n".join([result.stdout or "", result.stderr or ""])
+    return "--config" in help_text
+
+
+def _daemon_command_args(opencode_binary: str, opencode_subcommand: str, allocated_port: int, hostname: str) -> list[str]:
+    command = [
+        opencode_binary,
+        opencode_subcommand,
+    ]
+
+    if _opencode_supports_config_flag(opencode_binary, opencode_subcommand):
+        command.extend(["--config", "opencode.json"])
+
+    command.extend(
+        [
+            "--port",
+            str(allocated_port),
+            "--hostname",
+            hostname,
+        ],
+    )
+    return command
 
 
 def _venv_bin_path(project_root: Path) -> Path | None:
@@ -307,14 +345,7 @@ def _docker_command(project_root: Path, allocated_port: int, opencode_binary: st
         "-p",
         f"127.0.0.1:{allocated_port}:{allocated_port}",
         image,
-        opencode_binary,
-        opencode_subcommand,
-        "--config",
-        "opencode.json",
-        "--port",
-        str(allocated_port),
-        "--hostname",
-        "0.0.0.0",
+        *_daemon_command_args(opencode_binary, opencode_subcommand, allocated_port, "0.0.0.0"),
     ]
 
 
@@ -353,16 +384,7 @@ def start_opencode_daemon(project_absolute_path: str, allocated_port: int) -> su
     if sandbox_mode == "docker":
         command = _docker_command(project_root, allocated_port, opencode_binary, opencode_subcommand)
     else:
-        command = [
-            opencode_binary,
-            opencode_subcommand,
-            "--config",
-            "opencode.json",
-            "--port",
-            str(allocated_port),
-            "--hostname",
-            "127.0.0.1",
-        ]
+        command = _daemon_command_args(opencode_binary, opencode_subcommand, allocated_port, "127.0.0.1")
 
     logger.info(
         "Starting OpenCode daemon for project_root=%s port=%s config=%s default_agent=%s agents=%s warnings=%s",

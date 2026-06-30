@@ -11,7 +11,7 @@ from opencode_client import OpenCodeClient, OpenCodeClientError
 
 from ..models import OrchestrationRun, Project, TaskQueue
 from .daemon import daemon_directory_for_project, daemon_health, is_daemon_running, start_opencode_daemon, stop_opencode_daemon
-from .orchestration import mark_run_cancelled, mark_run_failed, release_project_lock
+from .orchestration import finalize_run_after_task_exit, mark_run_cancelled, mark_run_failed, release_project_lock
 from .realtime import broadcast_project_event
 from .telemetry import record_run_activity, send_run_status_event
 
@@ -42,10 +42,9 @@ def scan_and_enqueue_stuck_runs() -> list[int]:
     for run in candidates:
         if _fail_and_unlock_if_orphaned(run, threshold_seconds=threshold_seconds):
             continue
-        task_result = recover_stuck_run_task.delay(run.id)
-        run.celery_task_id = task_result.id
+        recover_stuck_run_task.delay(run.id)
         run.current_phase = "Recovery scheduled"
-        run.save(update_fields=["celery_task_id", "current_phase", "updated_at"])
+        run.save(update_fields=["current_phase", "updated_at"])
         send_run_status_event(run.project.id, run)
         enqueued.append(run.id)
 
@@ -61,6 +60,17 @@ def _fail_and_unlock_if_orphaned(run: OrchestrationRun, *, threshold_seconds: in
 
     task_state = AsyncResult(task_id).state
     if task_state in TERMINAL_TASK_STATES:
+        if task_state == "SUCCESS":
+            finalized_status = finalize_run_after_task_exit(run, task_state=task_state)
+            if finalized_status in {
+                OrchestrationRun.Status.COMPLETED,
+                OrchestrationRun.Status.FAILED,
+                OrchestrationRun.Status.CANCELLED,
+                OrchestrationRun.Status.AWAITING_PLAN_APPROVAL,
+                OrchestrationRun.Status.PLAN_READY,
+            }:
+                return True
+
         mark_run_failed(run, f"Run task {task_id} ended in state '{task_state}' before orchestration reached a terminal run status.")
         release_project_lock(run.project, reason="worker_crashed")
         return True

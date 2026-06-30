@@ -1,6 +1,8 @@
 import json
 import re
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from celery.result import AsyncResult
@@ -467,40 +469,16 @@ def perform_orchestration_run(run_id: int) -> dict:
         release_project_lock(run.project, reason="run_failed")
         raise
 
-    run.refresh_from_db(fields=["total_steps", "completed_steps", "failed_steps", "progress_percent", "current_phase", "status", "updated_at"])
-    if run.status in {OrchestrationRun.Status.AWAITING_PLAN_APPROVAL, OrchestrationRun.Status.PLAN_READY}:
+    finalized_status = finalize_run_after_task_exit(run, task_state="SUCCESS")
+    if finalized_status == OrchestrationRun.Status.AWAITING_PLAN_APPROVAL:
         return result
-    outcome_error = _evaluate_run_outcome(run)
-    if outcome_error:
-        mark_run_failed(run, outcome_error)
-        release_project_lock(run.project, reason="run_failed_outcome")
-        raise OrchestrationError(outcome_error)
-
-    transition_run(
-        run=run,
-        status=OrchestrationRun.Status.COMPLETED,
-        current_phase="Completed",
-        progress_percent=100,
-        finished=True,
-        activity_kind="run.completed",
-        activity_message=f"Completed {run.completed_steps} of {run.total_steps} steps.",
-        activity_payload={"completed_steps": run.completed_steps, "failed_steps": run.failed_steps, "total_steps": run.total_steps},
-    )
-
-    release_project_lock(run.project, reason="run_completed")
-
-    if run.user_id:
-        create_user_notification(
-            user=run.user,
-            kind="run_completed",
-            title=f"Run #{run.id} completed",
-            message=f"Project {run.project.name} completed successfully.",
-            project=run.project,
-            run=run,
-            payload={"run_id": run.id},
-        )
-
-    enqueue_github_sync_for_run(run)
+    if finalized_status == OrchestrationRun.Status.PLAN_READY:
+        return result
+    if finalized_status == OrchestrationRun.Status.FAILED:
+        run.refresh_from_db(fields=["last_error"])
+        raise OrchestrationError(run.last_error or "Run failed during post-task finalization.")
+    if finalized_status == OrchestrationRun.Status.CANCELLED:
+        return {"mode": "cancelled", "run_id": run.id}
     return result
 
 
@@ -939,6 +917,8 @@ def _execute_step(
     feedback = ""
     generated_diff = ""
 
+    is_verification_only_step = _is_verification_only_instruction(step["instruction"])
+
     for attempt in range(1, max_attempts + 1):
         task.status = TaskQueue.Status.RUNNING
         task.supervisor_feedback = feedback
@@ -1009,7 +989,12 @@ def _execute_step(
         )
         _broadcast_task_status(project, task)
 
-        generated_diff = diff_to_text(client.session_diff(worker_session_id, daemon_directory))
+        generated_diff = _capture_worker_diff_text(
+            client=client,
+            worker_session_id=worker_session_id,
+            daemon_directory=daemon_directory,
+            project_absolute_path=project.absolute_path,
+        )
         step_record.generated_diff = generated_diff
         step_record.save(update_fields=["generated_diff", "updated_at"])
         record_artifact(
@@ -1021,6 +1006,13 @@ def _execute_step(
             label=f"worker-diff-attempt-{attempt}",
             content=generated_diff,
         )
+        worker_response_text = _extract_response_text(
+            response_payload=worker_response,
+            client=client,
+            session_id=worker_session_id,
+            directory=daemon_directory,
+        )
+
         validation_feedback = _validate_step_with_supervisor(
             client=client,
             supervisor_session_id=supervisor_session_id,
@@ -1028,10 +1020,30 @@ def _execute_step(
             project=project,
             step=step,
             generated_diff=generated_diff,
+            worker_response_text=worker_response_text,
             run=run,
             step_record=step_record,
             task_record=task,
         )
+
+        if (
+            validation_feedback != "APPROVED"
+            and is_verification_only_step
+            and _is_effectively_empty_diff(generated_diff)
+            and _has_substantive_text(worker_response_text)
+            and _feedback_is_diff_only_rejection(validation_feedback)
+        ):
+            validation_feedback = "APPROVED"
+            record_run_activity(
+                run=run,
+                step=step_record,
+                task=task,
+                kind="step.validation_relaxed",
+                message="Verification-only step approved despite empty diff based on substantive worker output.",
+                level=OrchestrationRunActivity.Level.INFO,
+                session_id=supervisor_session_id,
+                attempt_count=attempt,
+            )
         if validation_feedback == "APPROVED":
             shell_payload = client.run_shell_command(
                 worker_session_id,
@@ -1145,6 +1157,7 @@ def _validate_step_with_supervisor(
     project: Project,
     step: dict,
     generated_diff: str,
+    worker_response_text: str,
     run: OrchestrationRun,
     step_record: OrchestrationStep | None = None,
     task_record: TaskQueue | None = None,
@@ -1159,6 +1172,7 @@ def _validate_step_with_supervisor(
         "reply with APPROVED only. Otherwise explain what must be fixed.\n\n"
         f"Validation guidance:\n{expected_artifact_guidance}\n\n"
         f"Step instruction:\n{step['instruction']}\n\n"
+        f"Worker response summary:\n{worker_response_text or '(empty)'}\n\n"
         f"Generated diff:\n{generated_diff}"
     )
     response = client.prompt(supervisor_session_id, daemon_directory, validation_prompt, supervisor_agent)
@@ -1315,6 +1329,151 @@ def _evaluate_run_outcome(run: OrchestrationRun) -> str:
     if run.completed_steps != run.total_steps:
         return f"Run finished in an inconsistent state: completed {run.completed_steps} of {run.total_steps} steps."
     return ""
+
+
+def finalize_run_after_task_exit(run: OrchestrationRun, *, task_state: str = "SUCCESS") -> str:
+    run.refresh_from_db(
+        fields=[
+            "status",
+            "total_steps",
+            "completed_steps",
+            "failed_steps",
+            "progress_percent",
+            "current_phase",
+            "last_error",
+            "updated_at",
+        ],
+    )
+    if run.status in {OrchestrationRun.Status.COMPLETED, OrchestrationRun.Status.FAILED, OrchestrationRun.Status.CANCELLED}:
+        return run.status
+    if run.status in {OrchestrationRun.Status.AWAITING_PLAN_APPROVAL, OrchestrationRun.Status.PLAN_READY}:
+        return run.status
+
+    _refresh_run_step_counters(run)
+    run.refresh_from_db(fields=["status", "total_steps", "completed_steps", "failed_steps", "last_error"])
+    outcome_error = _evaluate_run_outcome(run)
+    if outcome_error:
+        if task_state != "SUCCESS":
+            outcome_error = f"{outcome_error} (task_state={task_state})"
+        mark_run_failed(run, outcome_error)
+        release_project_lock(run.project, reason="run_failed_outcome")
+        return OrchestrationRun.Status.FAILED
+
+    transition_run(
+        run=run,
+        status=OrchestrationRun.Status.COMPLETED,
+        current_phase="Completed",
+        progress_percent=100,
+        finished=True,
+        activity_kind="run.completed",
+        activity_message=f"Completed {run.completed_steps} of {run.total_steps} steps.",
+        activity_payload={"completed_steps": run.completed_steps, "failed_steps": run.failed_steps, "total_steps": run.total_steps},
+    )
+    release_project_lock(run.project, reason="run_completed")
+    if run.user_id:
+        create_user_notification(
+            user=run.user,
+            kind="run_completed",
+            title=f"Run #{run.id} completed",
+            message=f"Project {run.project.name} completed successfully.",
+            project=run.project,
+            run=run,
+            payload={"run_id": run.id},
+        )
+    enqueue_github_sync_for_run(run)
+    return OrchestrationRun.Status.COMPLETED
+
+
+def _is_effectively_empty_diff(diff_text: str) -> bool:
+    cleaned = (diff_text or "").strip()
+    return cleaned in {"", "[]", "{}"}
+
+
+def _workspace_change_fallback_diff(project_absolute_path: str) -> str:
+    project_root = Path(project_absolute_path).expanduser().resolve()
+    status_result = subprocess.run(
+        ["git", "-C", str(project_root), "status", "--porcelain", "--untracked-files=all"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    status_text = (status_result.stdout or "").strip()
+    if not status_text:
+        return ""
+
+    status_lines = status_text.splitlines()
+    max_lines = 120
+    visible_lines = status_lines[:max_lines]
+    remaining = len(status_lines) - len(visible_lines)
+    rendered = "\n".join(visible_lines)
+    if remaining > 0:
+        rendered = f"{rendered}\n... (+{remaining} more files)"
+    return f"## git-status\n{rendered}"
+
+
+def _capture_worker_diff_text(
+    *,
+    client: OpenCodeClient,
+    worker_session_id: str,
+    daemon_directory: str,
+    project_absolute_path: str,
+) -> str:
+    session_diff = diff_to_text(client.session_diff(worker_session_id, daemon_directory))
+    if not _is_effectively_empty_diff(session_diff):
+        return session_diff
+    fallback = _workspace_change_fallback_diff(project_absolute_path)
+    return fallback or session_diff
+
+
+def _is_verification_only_instruction(instruction: str) -> bool:
+    text = (instruction or "").strip().lower()
+    if not text:
+        return False
+    edit_keywords = [
+        "create",
+        "add",
+        "write",
+        "modify",
+        "edit",
+        "update",
+        "delete",
+        "remove",
+        "rename",
+        "refactor",
+        "implement",
+        "migrate",
+    ]
+    if any(keyword in text for keyword in edit_keywords):
+        return False
+    verification_keywords = [
+        "verify",
+        "verification",
+        "confirm",
+        "check",
+        "validate",
+        "inspect",
+        "review",
+        "summarize",
+        "report",
+        "read",
+        "diagnostic",
+    ]
+    return any(keyword in text for keyword in verification_keywords)
+
+
+def _has_substantive_text(content: str) -> bool:
+    cleaned = (content or "").strip()
+    if not cleaned:
+        return False
+    return len(cleaned) >= 24
+
+
+def _feedback_is_diff_only_rejection(feedback: str) -> bool:
+    normalized = (feedback or "").strip().lower()
+    if not normalized:
+        return False
+    diff_markers = ["diff is empty", "generated diff is empty", "empty diff", "no diff", "without file changes"]
+    return any(marker in normalized for marker in diff_markers)
 
 
 def _allowed_worker_agents() -> list[str]:
